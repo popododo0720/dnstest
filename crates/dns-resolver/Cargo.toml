@@ -1,0 +1,12 @@
+[package]
+name = "dns-resolver"
+description = "Query resolution: zones, cache, upstream forwarding"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dns-proto.workspace = true
+dns-zone.workspace = true
+dns-cache.workspace = true
+tokio.workspace = true
+tracing.workspace = true

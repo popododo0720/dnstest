@@ -1,0 +1,29 @@
+; Demo zone for rdns.
+$ORIGIN example.lab.
+$TTL 3600
+
+@       IN SOA ns1 hostmaster (
+            2026070201 ; serial
+            7200       ; refresh
+            3600       ; retry
+            1209600    ; expire
+            300 )      ; negative-cache TTL
+
+@       IN NS   ns1
+ns1     IN A    10.0.0.1
+
+www     600 IN A 10.0.0.10
+        IN A    10.0.0.11
+www     IN AAAA fd00::10
+
+api     IN CNAME www              ; in-zone CNAME, chased server-side
+ext     IN CNAME cloudflare.com.  ; offsite CNAME, resolved via upstream when RD=1
+
+@       IN MX   10 mail
+mail    IN A    10.0.0.20
+
+@       IN TXT  "hello from rdns" "v=spf1 -all"
+
+_http._tcp IN SRV 0 5 8080 www
+
+*.dev   IN A    10.0.0.99         ; wildcard

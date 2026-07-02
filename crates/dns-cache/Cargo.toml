@@ -1,0 +1,8 @@
+[package]
+name = "dns-cache"
+description = "TTL-aware response cache with negative caching"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dns-proto.workspace = true

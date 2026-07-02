@@ -1,0 +1,14 @@
+[package]
+name = "rdns"
+description = "DNS server binary: UDP/TCP listeners and CLI"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dns-proto.workspace = true
+dns-zone.workspace = true
+dns-resolver.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

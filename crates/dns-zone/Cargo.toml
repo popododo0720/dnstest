@@ -1,0 +1,8 @@
+[package]
+name = "dns-zone"
+description = "Zone file parsing and authoritative lookups"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dns-proto.workspace = true

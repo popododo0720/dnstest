@@ -1,0 +1,7 @@
+[package]
+name = "dns-proto"
+description = "DNS wire format: names, compression, messages, EDNS0"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
