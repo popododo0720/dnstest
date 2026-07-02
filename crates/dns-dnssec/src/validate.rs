@@ -268,6 +268,11 @@ www  IN A 10.0.0.11
     }
 
     #[test]
+    fn verifies_rsa() {
+        check_alg(crate::ALG_RSASHA256); // generates a 2048-bit RSA key, signs, verifies
+    }
+
+    #[test]
     fn ds_matches_generated_key() {
         let zone = parse_zone_file(ZONE).unwrap();
         let (key, _) = DnssecKey::generate(zone.origin.clone(), ALG_ED25519, true).unwrap();

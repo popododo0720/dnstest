@@ -9,9 +9,13 @@
 
 use std::collections::HashMap;
 
+use dns_dnssec::nsec3::{Nsec3Params, hash_name};
 use dns_dnssec::validate::{parse_rrsig, verify_ds, verify_rrsig};
 use dns_metrics::Metrics;
-use dns_proto::message::{Message, RData, Record, TYPE_DNSKEY, TYPE_DS, TYPE_RRSIG};
+use dns_proto::message::{
+    Message, RCODE_NXDOMAIN, RData, Record, TYPE_DNSKEY, TYPE_DS, TYPE_NSEC, TYPE_NSEC3,
+    TYPE_RRSIG,
+};
 use dns_proto::name::DnsName;
 
 use crate::upstream::UpstreamPool;
@@ -80,19 +84,59 @@ impl Validator {
         Validator::new(vec![TrustAnchor::root_ksk_2017()])
     }
 
-    /// Validate a forwarded response. Each answer rrset is checked against the
-    /// keys of *its own* signer (a CNAME chain can cross zones), so the result
-    /// is Bogus only if some rrset has a signature that fails to verify under a
-    /// securely-reachable key. Unsigned/insecure rrsets pass through.
+    /// Validate a forwarded response. Each rrset is checked against the keys of
+    /// *its own* signer (a CNAME chain can cross zones). Positive answers and
+    /// the NSEC/NSEC3 records proving a negative answer are both authenticated;
+    /// the result is Bogus if a signature fails or a denial is not proven.
     pub async fn validate(
         &self,
         pool: &UpstreamPool,
         metrics: &Metrics,
         msg: &Message,
     ) -> Security {
-        // Distinct (owner, type) rrsets in the answer, excluding RRSIGs.
-        let mut sets: Vec<(DnsName, u16)> = msg
-            .answers
+        let mut ctx = Ctx { pool, metrics, keys: HashMap::new() };
+
+        // 1) Answer section.
+        let answer = self.verify_section(&mut ctx, &msg.answers).await;
+        if answer.bogus {
+            return Security::Bogus;
+        }
+
+        // 2) When the answer is a denial (NXDOMAIN or NODATA), the NSEC/NSEC3
+        //    records in the authority section must be authenticated and must
+        //    actually prove the denial.
+        let is_denial = msg.answers.iter().all(|r| r.rtype() == TYPE_RRSIG)
+            || msg.flags.rcode == RCODE_NXDOMAIN;
+        let mut denial_secure = false;
+        if is_denial && !msg.authorities.is_empty() {
+            let auth = self.verify_section(&mut ctx, &msg.authorities).await;
+            if auth.bogus {
+                return Security::Bogus;
+            }
+            // A securely-signed authority section that carries NSEC/NSEC3 and
+            // proves the denial for the queried name.
+            if auth.any_secure && self.denial_proven(msg) {
+                denial_secure = true;
+            } else if auth.any_secure && has_nsec(&msg.authorities) {
+                // Signed NSEC/NSEC3 present but coverage not established:
+                // reject rather than trust a possibly-replayed proof.
+                return Security::Bogus;
+            }
+        }
+
+        if answer.any_secure || denial_secure {
+            Security::Secure
+        } else {
+            Security::Insecure
+        }
+    }
+
+    /// Verify every signed rrset in `records` against its signer's validated
+    /// keys. `pool_records` is the record list the RRSIGs are drawn from
+    /// (same as `records` here). Returns whether anything validated securely
+    /// and whether any signed rrset failed (bogus).
+    async fn verify_section(&self, ctx: &mut Ctx<'_>, records: &[Record]) -> SectionResult {
+        let mut sets: Vec<(DnsName, u16)> = records
             .iter()
             .filter(|r| r.rtype() != TYPE_RRSIG)
             .map(|r| (r.name.clone(), r.rtype()))
@@ -100,19 +144,11 @@ impl Validator {
         sets.sort_by(|a, b| (a.0.to_string(), a.1).cmp(&(b.0.to_string(), b.1)));
         sets.dedup();
 
-        let mut ctx = Ctx { pool, metrics, keys: HashMap::new() };
         let mut any_secure = false;
-
         for (owner, rtype) in sets {
-            let rrset: Vec<Record> = msg
-                .answers
-                .iter()
-                .filter(|r| r.name == owner && r.rtype() == rtype)
-                .cloned()
-                .collect();
-            // RRSIGs covering this rrset (owner + type_covered match).
-            let sigs: Vec<Vec<u8>> = msg
-                .answers
+            let rrset: Vec<Record> =
+                records.iter().filter(|r| r.name == owner && r.rtype() == rtype).cloned().collect();
+            let sigs: Vec<Vec<u8>> = records
                 .iter()
                 .filter(|r| r.rtype() == TYPE_RRSIG && r.name == owner)
                 .filter_map(|r| match &r.rdata {
@@ -122,17 +158,15 @@ impl Validator {
                 .filter(|d| parse_rrsig(d).map(|f| f.type_covered) == Some(rtype))
                 .collect();
             if sigs.is_empty() {
-                continue; // unsigned rrset (e.g. glue): not covered
+                continue; // unsigned rrset (glue, or an unsigned zone's data)
             }
-            // Validate against each covering RRSIG's own signer.
             let mut verified = false;
             for sig in &sigs {
                 let Some(fields) = parse_rrsig(sig) else { continue };
                 let signer = fields.signer.clone();
-                match self.dnskeys(&mut ctx, &signer, 0).await {
+                match self.dnskeys(ctx, &signer, 0).await {
                     None => {
-                        // Insecure signer: treat this rrset as insecure.
-                        verified = true;
+                        verified = true; // insecure signer
                         break;
                     }
                     Some(keys) if keys.is_empty() => continue, // broken chain
@@ -146,11 +180,27 @@ impl Validator {
                 }
             }
             if !verified {
-                return Security::Bogus;
+                return SectionResult { any_secure, bogus: true };
             }
         }
+        SectionResult { any_secure, bogus: false }
+    }
 
-        if any_secure { Security::Secure } else { Security::Insecure }
+    /// Does the authority section's NSEC/NSEC3 set actually prove the denial
+    /// for the queried name?
+    fn denial_proven(&self, msg: &Message) -> bool {
+        let Some(q) = msg.questions.first() else { return false };
+        let nsec3: Vec<&Record> =
+            msg.authorities.iter().filter(|r| r.rtype() == TYPE_NSEC3).collect();
+        if !nsec3.is_empty() {
+            return nsec3_proves(&q.qname, &nsec3);
+        }
+        let nsec: Vec<&Record> =
+            msg.authorities.iter().filter(|r| r.rtype() == TYPE_NSEC).collect();
+        if !nsec.is_empty() {
+            return nsec_proves(&q.qname, q.qtype, &nsec);
+        }
+        false
     }
 
     /// Validated DNSKEY rdata set for `zone`: `Some(keys)` if secure, `None`
@@ -301,6 +351,173 @@ enum DsResult {
     Secure(Vec<Vec<u8>>),
     Insecure,
     Bogus,
+}
+
+struct SectionResult {
+    any_secure: bool,
+    bogus: bool,
+}
+
+fn has_nsec(records: &[Record]) -> bool {
+    records.iter().any(|r| matches!(r.rtype(), TYPE_NSEC | TYPE_NSEC3))
+}
+
+/// Canonical name ordering key (RFC 4034 §6.1): labels compared right-to-left.
+fn canon_key(name: &DnsName) -> Vec<Vec<u8>> {
+    let mut labels: Vec<Vec<u8>> = name.labels().to_vec();
+    labels.reverse();
+    labels
+}
+
+/// Parse an NSEC rdata into (next owner name, covered type set).
+fn parse_nsec(rdata: &[u8]) -> Option<(DnsName, Vec<u16>)> {
+    let mut pos = 0;
+    let next = DnsName::from_wire(rdata, &mut pos).ok()?;
+    let types = parse_type_bitmap(&rdata[pos..]);
+    Some((next, types))
+}
+
+/// Parse the RFC 4034 §4.1.2 type bitmap (windowed).
+fn parse_type_bitmap(mut data: &[u8]) -> Vec<u16> {
+    let mut types = Vec::new();
+    while data.len() >= 2 {
+        let window = data[0] as u16;
+        let len = data[1] as usize;
+        if data.len() < 2 + len {
+            break;
+        }
+        for (i, &byte) in data[2..2 + len].iter().enumerate() {
+            for bit in 0..8 {
+                if byte & (0x80 >> bit) != 0 {
+                    types.push(window * 256 + (i as u16) * 8 + bit as u16);
+                }
+            }
+        }
+        data = &data[2 + len..];
+    }
+    types
+}
+
+/// True if the signed NSEC records prove `qname`/`qtype` is absent: either an
+/// exact-match NSEC without the type (NODATA), or an NSEC whose range covers
+/// the name (NXDOMAIN).
+fn nsec_proves(qname: &DnsName, qtype: u16, nsec: &[&Record]) -> bool {
+    let target = canon_key(qname);
+    for rec in nsec {
+        let RData::Unknown { data, .. } = &rec.rdata else { continue };
+        let Some((next, types)) = parse_nsec(data) else { continue };
+        let owner = canon_key(&rec.name);
+        // NODATA: exact owner match, queried type not in the bitmap.
+        if rec.name == *qname {
+            if !types.contains(&qtype) {
+                return true;
+            }
+            continue;
+        }
+        // NXDOMAIN: owner < qname < next (with the zone-apex wrap at the end).
+        let next_k = canon_key(&next);
+        let covered = if owner < next_k {
+            owner < target && target < next_k
+        } else {
+            // Last NSEC wraps past the apex.
+            target > owner || target < next_k
+        };
+        if covered {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse an NSEC3 rdata: (params, next-hash, covered types).
+fn parse_nsec3(rdata: &[u8]) -> Option<(Nsec3Params, Vec<u8>, Vec<u16>)> {
+    if rdata.len() < 5 {
+        return None;
+    }
+    let iterations = u16::from_be_bytes([rdata[2], rdata[3]]);
+    let salt_len = rdata[4] as usize;
+    let salt = rdata.get(5..5 + salt_len)?.to_vec();
+    let hash_pos = 5 + salt_len;
+    let hash_len = *rdata.get(hash_pos)? as usize;
+    let next = rdata.get(hash_pos + 1..hash_pos + 1 + hash_len)?.to_vec();
+    let types = parse_type_bitmap(&rdata[hash_pos + 1 + hash_len..]);
+    Some((Nsec3Params { iterations, salt }, next, types))
+}
+
+/// The base32hex label of an NSEC3 owner, decoded to the raw hash.
+fn nsec3_owner_hash(name: &DnsName) -> Option<Vec<u8>> {
+    let label = name.labels().first()?;
+    base32hex_decode(std::str::from_utf8(label).ok()?)
+}
+
+fn base32hex_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = 0u32;
+    let mut bits = 0;
+    for c in s.chars() {
+        let v = match c.to_ascii_lowercase() {
+            '0'..='9' => c as u32 - '0' as u32,
+            'a'..='v' => c.to_ascii_lowercase() as u32 - 'a' as u32 + 10,
+            _ => return None,
+        };
+        buf = (buf << 5) | v;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// True if the signed NSEC3 records prove the denial via a matching (NODATA)
+/// or a closest-encloser proof (NXDOMAIN). Uses the params from the records.
+fn nsec3_proves(qname: &DnsName, nsec3: &[&Record]) -> bool {
+    let Some(params) = nsec3.iter().find_map(|r| match &r.rdata {
+        RData::Unknown { data, .. } => parse_nsec3(data).map(|(p, _, _)| p),
+        _ => None,
+    }) else {
+        return false;
+    };
+    // Owner hash -> (next hash) for range checks; also collect matches.
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = nsec3
+        .iter()
+        .filter_map(|r| {
+            let owner = nsec3_owner_hash(&r.name)?;
+            let RData::Unknown { data, .. } = &r.rdata else { return None };
+            let (_, next, _) = parse_nsec3(data)?;
+            Some((owner, next))
+        })
+        .collect();
+    let matches = |h: &[u8]| entries.iter().any(|(o, _)| o.as_slice() == h);
+    let covers = |h: &[u8]| {
+        entries.iter().any(|(o, next)| {
+            if o < next {
+                o.as_slice() < h && h <= next.as_slice()
+            } else {
+                h > o.as_slice() || h <= next.as_slice()
+            }
+        })
+    };
+
+    // NODATA: NSEC3 matching qname's own hash.
+    if matches(&hash_name(qname, &params)) {
+        return true;
+    }
+    // NXDOMAIN closest-encloser proof: find the closest ancestor whose hash
+    // matches, then the next-closer name must be covered.
+    let labels = qname.labels();
+    for skip in 1..labels.len() {
+        let Ok(ce) = DnsName::from_labels(labels[skip..].to_vec()) else { continue };
+        if matches(&hash_name(&ce, &params)) {
+            // next closer = one label longer than ce toward qname.
+            let Ok(nc) = DnsName::from_labels(labels[skip - 1..].to_vec()) else { continue };
+            if covers(&hash_name(&nc, &params)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]

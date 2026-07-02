@@ -329,10 +329,8 @@ impl Resolver {
     pub async fn resolve_pending(&self, mut p: Pending) -> Message {
         match self.resolve_external(&p.target, p.qtype).await {
             Ok((rcode, answers, authorities, secure)) => {
-                merge(&mut p.resp, (rcode, answers, authorities), p.append);
-                // AD is only meaningful when the client can do DNSSEC (RFC
-                // 6840 §5.7): we set it on securely-validated answers.
-                p.resp.flags.ad = secure;
+                // AD is set from the DNSSEC status (RFC 6840 §5.7) via merge.
+                merge(&mut p.resp, dns_cache::Hit { rcode, answers, authorities, secure }, p.append);
             }
             Err(ForwardError::Bogus) => {
                 Metrics::inc(&self.metrics.upstream_failures);
@@ -356,7 +354,7 @@ impl Resolver {
         p.resp
     }
 
-    fn cache_get(&self, key: &Key) -> Option<(u8, Vec<Record>, Vec<Record>)> {
+    fn cache_get(&self, key: &Key) -> Option<dns_cache::Hit> {
         let hit = self.cache.get(key);
         if hit.is_some() {
             Metrics::inc(&self.metrics.cache_hits);
@@ -373,8 +371,8 @@ impl Resolver {
     ) -> Result<(u8, Vec<Record>, Vec<Record>, bool), ForwardError> {
         let key = Key { qname: qname.clone(), qtype };
         for _ in 0..3 {
-            if let Some((rcode, answers, authorities)) = self.cache_get(&key) {
-                return Ok((rcode, answers, authorities, false));
+            if let Some(hit) = self.cache_get(&key) {
+                return Ok((hit.rcode, hit.answers, hit.authorities, hit.secure));
             }
             match self.flight.begin(&key) {
                 Role::Leader(_guard) => {
@@ -407,6 +405,7 @@ impl Resolver {
                         msg.flags.rcode,
                         msg.answers.clone(),
                         authorities.clone(),
+                        secure,
                     );
                     return Ok((msg.flags.rcode, msg.answers, authorities, secure));
                 }
@@ -476,20 +475,24 @@ fn find_zone<'a>(zones: &'a [Zone], name: &DnsName) -> Option<&'a Zone> {
         .max_by_key(|z| z.origin.label_count())
 }
 
-/// Fold a lookup result into a response. `append` keeps existing answers (the
+/// Fold a cached/looked-up result into a response and carry its DNSSEC
+/// validated status to the AD bit. `append` keeps existing answers (the
 /// authoritative part of a CNAME chain) and only adds authority records when
 /// the tail produced no answers.
-fn merge(resp: &mut Message, hit: (u8, Vec<Record>, Vec<Record>), append: bool) {
-    let (rcode, mut answers, mut authorities) = hit;
+fn merge(resp: &mut Message, hit: dns_cache::Hit, append: bool) {
+    let dns_cache::Hit { rcode, mut answers, mut authorities, secure } = hit;
     resp.flags.rcode = rcode;
     if append {
         if answers.is_empty() {
             resp.authorities.append(&mut authorities);
         }
         resp.answers.append(&mut answers);
+        // The whole chain is authenticated only if both halves are.
+        resp.flags.ad = resp.flags.ad && secure;
     } else {
         resp.answers = answers;
         resp.authorities = authorities;
+        resp.flags.ad = secure;
     }
 }
 

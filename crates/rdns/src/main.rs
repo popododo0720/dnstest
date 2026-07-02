@@ -128,6 +128,7 @@ fn load_dnssec_keys(
     let alg = match cfg.dnssec.algorithm.to_ascii_lowercase().as_str() {
         "ed25519" => dns_dnssec::ALG_ED25519,
         "ecdsap256" | "ecdsa" => dns_dnssec::ALG_ECDSAP256,
+        "rsasha256" | "rsa" => dns_dnssec::ALG_RSASHA256,
         other => return Err(format!("unknown dnssec algorithm '{other}'")),
     };
 
@@ -240,6 +241,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             keys.len(),
             if nsec3.is_some() { "NSEC3" } else { "NSEC" }
         );
+
+        // Automatic re-signing before signatures expire: refresh at a third of
+        // the validity window (RFC 6781 §4.1.1.1 refresh interval), so RRSIGs
+        // are always renewed well ahead of expiry with no operator action.
+        let interval = (validity / 3).max(3600);
+        let (keys, origins, nsec3c) = (keys.clone(), origins.clone(), nsec3.clone());
+        let (resolver_c, metrics_c) = (resolver.clone(), metrics.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                resolver_c.resign(&keys, &origins, unix_now(), validity, nsec3c.clone());
+                dns_metrics::Metrics::inc(&metrics_c.zone_reloads);
+                info!("DNSSEC: refreshed signatures for {} zone(s)", origins.len());
+            }
+        });
+        info!("DNSSEC: auto re-sign every {}h", interval / 3600);
     }
 
     // Secondary zones: one refresh task per zone, kickable via NOTIFY.

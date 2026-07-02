@@ -64,31 +64,36 @@ a full AXFR.
 
 ### Online signing
 
-`[dnssec]` signs zones online with ECDSA P-256 (algorithm 13) or Ed25519 (15).
-When a query carries the DO bit, responses include RRSIGs, DNSKEY at the apex,
-and NSEC or NSEC3 records for authenticated denial (NXDOMAIN and NODATA). The DS
-record to upload to the parent is printed at startup. Zones are re-signed on
-change and on reload.
+`[dnssec]` signs zones online with ECDSA P-256 (algorithm 13), Ed25519 (15), or
+RSA/SHA-256 (8). When a query carries the DO bit, responses include RRSIGs,
+DNSKEY at the apex, and NSEC or NSEC3 records for authenticated denial (NXDOMAIN
+and NODATA). The DS record to upload to the parent is printed at startup.
 
-Multiple keys are supported for KSK/ZSK separation and pre-publish key rollover:
-the DNSKEY RRset is signed by the SEP (KSK) keys, zone data by the ZSK keys.
-NSEC3 (`dnssec.nsec3`) uses iterated SHA-1 with a configurable salt and provides
+Signatures are refreshed automatically at a third of the validity window (a
+background timer), and re-signed on change and on reload, so RRSIGs never
+expire without operator action.
+
+Multiple keys are supported for KSK/ZSK separation and key rollover: the DNSKEY
+RRset is signed by the SEP (KSK) keys, zone data by the ZSK keys. NSEC3
+(`dnssec.nsec3`) uses iterated SHA-1 with a configurable salt and provides
 closest-encloser proofs.
 
 Signatures were verified independently with dnspython + pyca/cryptography across
-ECDSA and Ed25519, for positive answers, DNSKEY, and NSEC/NSEC3 denial.
+RSA, ECDSA, and Ed25519, for positive answers, DNSKEY, and NSEC/NSEC3 denial.
 
 ### Validating resolver
 
 Setting `recursion.validate = true` validates forwarded answers against the
-DNSSEC chain of trust from the IANA root trust anchor. Each answer rrset is
-checked against its own signer's keys (so cross-zone CNAME chains validate
-correctly). Securely-validated answers set the AD bit; forged or broken chains
-return SERVFAIL; unsigned zones pass through unauthenticated.
+DNSSEC chain of trust from the IANA root trust anchor. Each rrset is checked
+against its own signer's keys (so cross-zone CNAME chains validate correctly),
+and negative answers are authenticated through their NSEC/NSEC3 records,
+including range coverage and closest-encloser proofs. Securely-validated answers
+set the AD bit — preserved across cache hits — while forged or broken chains
+return SERVFAIL and unsigned zones pass through unauthenticated.
 
 Verified against the live internet: valid signatures (ECDSA and RSA, including
-1024-bit ZSKs) set AD, while `dnssec-failed.org` and `sigfail.verteiltesysteme.net`
-return SERVFAIL.
+1024-bit ZSKs) set AD on both positive and NXDOMAIN/NODATA answers, while
+`dnssec-failed.org` and `sigfail.verteiltesysteme.net` return SERVFAIL.
 
 ## DNS-over-TLS and DNS-over-HTTPS
 
@@ -129,15 +134,4 @@ crates/
   rdns          binary: UDP/TCP/DoT/DoH listeners, management API, config
 ```
 
-Tests: `cargo test` (59).
-
-## Known limitations
-
-- The validating resolver validates positive answers cryptographically; NSEC/
-  NSEC3 denial from upstream is treated as insecure rather than proven, and the
-  AD bit is set only on freshly validated answers (not cache hits).
-- DNSSEC signing offers ECDSA P-256 and Ed25519 (both recommended by RFC 8624);
-  RSA signing is intentionally omitted (ring cannot generate RSA keys), though
-  RSA is fully supported for validation.
-- Automatic key-rollover scheduling is not implemented; rollover is performed by
-  configuring multiple keys.
+Tests: `cargo test` (60).

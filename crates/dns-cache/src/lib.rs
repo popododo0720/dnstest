@@ -25,8 +25,18 @@ struct Entry {
     rcode: u8,
     answers: Vec<Record>,
     authorities: Vec<Record>,
+    /// DNSSEC-validated (AD bit) at insertion time.
+    secure: bool,
     stored: Instant,
     expires: Instant,
+}
+
+/// A cache hit: response records plus their validated status.
+pub struct Hit {
+    pub rcode: u8,
+    pub answers: Vec<Record>,
+    pub authorities: Vec<Record>,
+    pub secure: bool,
 }
 
 pub struct Cache {
@@ -39,9 +49,9 @@ impl Cache {
         Cache { inner: RwLock::new(HashMap::new()), max_entries: max_entries.max(1) }
     }
 
-    /// Cache hit returns (rcode, answers, authorities) with TTLs decremented
-    /// by the time spent in the cache.
-    pub fn get(&self, key: &Key) -> Option<(u8, Vec<Record>, Vec<Record>)> {
+    /// Cache hit with TTLs decremented by the time spent in the cache, and
+    /// the DNSSEC-validated status preserved for the AD bit.
+    pub fn get(&self, key: &Key) -> Option<Hit> {
         let now = Instant::now();
         {
             let map = self.inner.read().unwrap();
@@ -54,11 +64,12 @@ impl Cache {
                         r.ttl = r.ttl.saturating_sub(elapsed).max(1);
                         r
                     };
-                    return Some((
-                        e.rcode,
-                        e.answers.iter().map(adjust).collect(),
-                        e.authorities.iter().map(adjust).collect(),
-                    ));
+                    return Some(Hit {
+                        rcode: e.rcode,
+                        answers: e.answers.iter().map(adjust).collect(),
+                        authorities: e.authorities.iter().map(adjust).collect(),
+                        secure: e.secure,
+                    });
                 }
                 // Expired entries are kept for the serve-stale window and
                 // only evicted once past it.
@@ -72,7 +83,7 @@ impl Cache {
 
     /// Serve-stale (RFC 8767): an expired entry within the stale window,
     /// answers re-labeled with a short TTL. Only for upstream outages.
-    pub fn get_stale(&self, key: &Key) -> Option<(u8, Vec<Record>, Vec<Record>)> {
+    pub fn get_stale(&self, key: &Key) -> Option<Hit> {
         let now = Instant::now();
         let map = self.inner.read().unwrap();
         let e = map.get(key)?;
@@ -84,16 +95,24 @@ impl Cache {
             r.ttl = STALE_TTL;
             r
         };
-        Some((
-            e.rcode,
-            e.answers.iter().map(adjust).collect(),
-            e.authorities.iter().map(adjust).collect(),
-        ))
+        Some(Hit {
+            rcode: e.rcode,
+            answers: e.answers.iter().map(adjust).collect(),
+            authorities: e.authorities.iter().map(adjust).collect(),
+            secure: e.secure,
+        })
     }
 
     /// Store a response. Only cacheable outcomes (NOERROR/NXDOMAIN) are kept;
     /// negative entries live for min(SOA minimum, SOA TTL) per RFC 2308.
-    pub fn insert(&self, key: Key, rcode: u8, answers: Vec<Record>, authorities: Vec<Record>) {
+    pub fn insert(
+        &self,
+        key: Key,
+        rcode: u8,
+        answers: Vec<Record>,
+        authorities: Vec<Record>,
+        secure: bool,
+    ) {
         if rcode != RCODE_NOERROR && rcode != RCODE_NXDOMAIN {
             return;
         }
@@ -115,6 +134,7 @@ impl Cache {
             rcode,
             answers,
             authorities,
+            secure,
             stored: now,
             expires: now + Duration::from_secs(ttl as u64),
         };
@@ -164,8 +184,9 @@ mod tests {
     fn positive_roundtrip() {
         let cache = Cache::new(10);
         let key = Key { qname: n("www.example.com"), qtype: 1 };
-        cache.insert(key.clone(), 0, vec![a_record("www.example.com", 300)], vec![]);
-        let (rcode, answers, _) = cache.get(&key).expect("hit");
+        cache.insert(key.clone(), 0, vec![a_record("www.example.com", 300)], vec![], false);
+        let hit = cache.get(&key).expect("hit");
+        let (rcode, answers) = (hit.rcode, hit.answers);
         assert_eq!(rcode, 0);
         assert_eq!(answers.len(), 1);
         assert!(answers[0].ttl <= 300 && answers[0].ttl >= 299);
@@ -175,9 +196,9 @@ mod tests {
     fn ttl_zero_and_servfail_not_cached() {
         let cache = Cache::new(10);
         let key = Key { qname: n("a.example"), qtype: 1 };
-        cache.insert(key.clone(), 0, vec![a_record("a.example", 0)], vec![]);
+        cache.insert(key.clone(), 0, vec![a_record("a.example", 0)], vec![], false);
         assert!(cache.get(&key).is_none());
-        cache.insert(key.clone(), 2, vec![a_record("a.example", 300)], vec![]);
+        cache.insert(key.clone(), 2, vec![a_record("a.example", 300)], vec![], false);
         assert!(cache.get(&key).is_none());
     }
 
@@ -199,8 +220,9 @@ mod tests {
                 minimum: 300,
             }),
         };
-        cache.insert(key.clone(), 3, vec![], vec![soa]);
-        let (rcode, answers, authorities) = cache.get(&key).expect("negative hit");
+        cache.insert(key.clone(), 3, vec![], vec![soa], true);
+        let hit = cache.get(&key).expect("negative hit");
+        let (rcode, answers, authorities) = (hit.rcode, hit.answers, hit.authorities);
         assert_eq!(rcode, 3);
         assert!(answers.is_empty());
         assert_eq!(authorities.len(), 1);
@@ -211,7 +233,7 @@ mod tests {
         let cache = Cache::new(5);
         for i in 0..50 {
             let key = Key { qname: n(&format!("h{i}.example.com")), qtype: 1 };
-            cache.insert(key, 0, vec![a_record("x.example.com", 300)], vec![]);
+            cache.insert(key, 0, vec![a_record("x.example.com", 300)], vec![], false);
         }
         assert!(cache.len() <= 5);
     }

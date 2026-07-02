@@ -22,18 +22,21 @@ use dns_proto::name::DnsName;
 use nsec3::{Nsec3Params, hash_name};
 use dns_zone::Zone;
 use ring::rand::SystemRandom;
-use ring::signature::{EcdsaKeyPair, Ed25519KeyPair, KeyPair};
+use ring::signature::{EcdsaKeyPair, Ed25519KeyPair, KeyPair, RsaKeyPair};
 
+pub const ALG_RSASHA256: u8 = 8;
 pub const ALG_ECDSAP256: u8 = 13;
 pub const ALG_ED25519: u8 = 15;
 
 const FLAG_ZONE_KEY: u16 = 0x0100; // bit 7
 const FLAG_SEP: u16 = 0x0001; // bit 15 (KSK)
 const DIGEST_SHA256: u8 = 2;
+const RSA_BITS: usize = 2048;
 
 enum Material {
     Ed25519(Ed25519KeyPair),
     Ecdsa(EcdsaKeyPair),
+    Rsa(RsaKeyPair),
 }
 
 /// A single DNSSEC key: algorithm, role (KSK/ZSK), and signing material.
@@ -52,22 +55,39 @@ impl DnssecKey {
     /// and its persistable material (`alg:base64`).
     pub fn generate(signer: DnsName, algorithm: u8, ksk: bool) -> Result<(Self, String), String> {
         let rng = SystemRandom::new();
-        let (material, secret) = match algorithm {
+        let (material, secret, public) = match algorithm {
             ALG_ED25519 => {
                 let seed = ring::rand::generate::<[u8; 32]>(&rng).map_err(|_| "rng")?.expose();
                 let kp = Ed25519KeyPair::from_seed_unchecked(&seed).map_err(|_| "ed25519")?;
-                (Material::Ed25519(kp), seed.to_vec())
+                let public = kp.public_key().as_ref().to_vec();
+                (Material::Ed25519(kp), seed.to_vec(), public)
             }
             ALG_ECDSAP256 => {
                 let alg = &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING;
                 let pkcs8 = EcdsaKeyPair::generate_pkcs8(alg, &rng).map_err(|_| "ecdsa gen")?;
                 let kp = EcdsaKeyPair::from_pkcs8(alg, pkcs8.as_ref(), &rng)
                     .map_err(|_| "ecdsa load")?;
-                (Material::Ecdsa(kp), pkcs8.as_ref().to_vec())
+                // ring gives 0x04||X||Y; DNSKEY wants the bare X||Y.
+                let public = kp.public_key().as_ref()[1..].to_vec();
+                (Material::Ecdsa(kp), pkcs8.as_ref().to_vec(), public)
+            }
+            ALG_RSASHA256 => {
+                // ring cannot generate RSA keys; use the `rsa` crate, then
+                // load the PKCS#8 into ring for signing.
+                use rsa::pkcs8::EncodePrivateKey;
+                use rsa::traits::PublicKeyParts;
+                let mut osrng = rand::rngs::OsRng;
+                let priv_key = rsa::RsaPrivateKey::new(&mut osrng, RSA_BITS)
+                    .map_err(|e| format!("rsa gen: {e}"))?;
+                let pkcs8 = priv_key.to_pkcs8_der().map_err(|e| format!("rsa pkcs8: {e}"))?;
+                let der = pkcs8.as_bytes().to_vec();
+                let kp = RsaKeyPair::from_pkcs8(&der).map_err(|e| format!("rsa load: {e}"))?;
+                let public = rsa_dnskey_public(&priv_key.e().to_bytes_be(), &priv_key.n().to_bytes_be());
+                (Material::Rsa(kp), der, public)
             }
             other => return Err(format!("unsupported signing algorithm {other}")),
         };
-        let key = Self::finish(material, algorithm, ksk, signer)?;
+        let key = Self::finish(material, algorithm, ksk, signer, public);
         Ok((key, format!("{algorithm}:{}", b64(&secret))))
     }
 
@@ -77,32 +97,45 @@ impl DnssecKey {
         let algorithm: u8 = alg_str.parse().map_err(|_| "bad algorithm number")?;
         let secret = unb64(b64s).ok_or("bad base64 material")?;
         let rng = SystemRandom::new();
-        let material = match algorithm {
+        let (material, public) = match algorithm {
             ALG_ED25519 => {
-                let seed: [u8; 32] = secret.as_slice().try_into().map_err(|_| "seed must be 32 bytes")?;
-                Material::Ed25519(Ed25519KeyPair::from_seed_unchecked(&seed).map_err(|_| "ed25519")?)
+                let seed: [u8; 32] =
+                    secret.as_slice().try_into().map_err(|_| "seed must be 32 bytes")?;
+                let kp = Ed25519KeyPair::from_seed_unchecked(&seed).map_err(|_| "ed25519")?;
+                let public = kp.public_key().as_ref().to_vec();
+                (Material::Ed25519(kp), public)
             }
             ALG_ECDSAP256 => {
                 let alg = &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING;
-                Material::Ecdsa(
-                    EcdsaKeyPair::from_pkcs8(alg, &secret, &rng).map_err(|_| "ecdsa pkcs8")?,
-                )
+                let kp = EcdsaKeyPair::from_pkcs8(alg, &secret, &rng).map_err(|_| "ecdsa pkcs8")?;
+                let public = kp.public_key().as_ref()[1..].to_vec();
+                (Material::Ecdsa(kp), public)
+            }
+            ALG_RSASHA256 => {
+                use rsa::pkcs8::DecodePrivateKey;
+                use rsa::traits::PublicKeyParts;
+                let priv_key = rsa::RsaPrivateKey::from_pkcs8_der(&secret)
+                    .map_err(|e| format!("rsa pkcs8: {e}"))?;
+                let kp = RsaKeyPair::from_pkcs8(&secret).map_err(|e| format!("rsa load: {e}"))?;
+                let public =
+                    rsa_dnskey_public(&priv_key.e().to_bytes_be(), &priv_key.n().to_bytes_be());
+                (Material::Rsa(kp), public)
             }
             other => return Err(format!("unsupported signing algorithm {other}")),
         };
-        Self::finish(material, algorithm, ksk, signer)
+        Ok(Self::finish(material, algorithm, ksk, signer, public))
     }
 
-    fn finish(material: Material, algorithm: u8, ksk: bool, signer: DnsName) -> Result<Self, String> {
-        // DNSSEC public key encoding (RFC 6605 §4 for ECDSA, 8080 for Ed25519).
-        let public = match &material {
-            Material::Ed25519(kp) => kp.public_key().as_ref().to_vec(),
-            // ring gives 0x04||X||Y; DNSKEY wants the bare X||Y.
-            Material::Ecdsa(kp) => kp.public_key().as_ref()[1..].to_vec(),
-        };
+    fn finish(
+        material: Material,
+        algorithm: u8,
+        ksk: bool,
+        signer: DnsName,
+        public: Vec<u8>,
+    ) -> Self {
         let flags = FLAG_ZONE_KEY | if ksk { FLAG_SEP } else { 0 };
         let key_tag = key_tag(&dnskey_rdata(flags, algorithm, &public));
-        Ok(DnssecKey { material, algorithm, flags, public, signer, key_tag })
+        DnssecKey { material, algorithm, flags, public, signer, key_tag }
     }
 
     pub fn key_tag(&self) -> u16 {
@@ -136,14 +169,35 @@ impl DnssecKey {
     }
 
     fn sign(&self, data: &[u8]) -> Vec<u8> {
+        let rng = SystemRandom::new();
         match &self.material {
             Material::Ed25519(kp) => kp.sign(data).as_ref().to_vec(),
             Material::Ecdsa(kp) => {
-                let rng = SystemRandom::new();
                 kp.sign(&rng, data).map(|s| s.as_ref().to_vec()).unwrap_or_default()
+            }
+            Material::Rsa(kp) => {
+                let mut sig = vec![0u8; kp.public().modulus_len()];
+                match kp.sign(&ring::signature::RSA_PKCS1_SHA256, &rng, data, &mut sig) {
+                    Ok(()) => sig,
+                    Err(_) => Vec::new(),
+                }
             }
         }
     }
+}
+
+/// RFC 3110 RSA public key in DNSKEY form: exponent length, exponent, modulus.
+fn rsa_dnskey_public(exp: &[u8], modulus: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    if exp.len() <= 255 {
+        out.push(exp.len() as u8);
+    } else {
+        out.push(0);
+        out.extend_from_slice(&(exp.len() as u16).to_be_bytes());
+    }
+    out.extend_from_slice(exp);
+    out.extend_from_slice(modulus);
+    out
 }
 
 fn dnskey_rdata(flags: u16, algorithm: u8, public: &[u8]) -> Vec<u8> {

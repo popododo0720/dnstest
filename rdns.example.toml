@@ -56,7 +56,7 @@ notify = []                    # secondaries to NOTIFY on zone change
 [dnssec]
 # key_file = "dnssec.keys"         # `alg:base64` lines (ksk/zsk); auto-generated
 # zones = ["example.lab."]         # origins to sign online
-# algorithm = "ecdsap256"          # or "ed25519" (for auto-generated keys)
+# algorithm = "ecdsap256"          # ed25519, ecdsap256, or rsasha256
 # validity_days = 14
 # nsec3 = false                    # true = NSEC3 hashed denial instead of NSEC
 # nsec3_iterations = 0

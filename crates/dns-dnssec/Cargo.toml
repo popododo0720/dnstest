@@ -1,6 +1,6 @@
 [package]
 name = "dns-dnssec"
-description = "DNSSEC online signing: DNSKEY, RRSIG, NSEC, DS (Ed25519)"
+description = "DNSSEC signing (RSA/ECDSA/Ed25519) and validation"
 version.workspace = true
 edition.workspace = true
 
@@ -8,3 +8,5 @@ edition.workspace = true
 dns-proto.workspace = true
 dns-zone.workspace = true
 ring.workspace = true
+rsa = { workspace = true }
+rand = { workspace = true }
