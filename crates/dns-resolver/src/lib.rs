@@ -10,9 +10,11 @@
 mod flight;
 mod rpz;
 mod upstream;
+mod validator;
 
 pub use rpz::{Rpz, RpzAction};
 pub use upstream::ForwardError;
+pub use validator::{Security, TrustAnchor, Validator};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -24,7 +26,7 @@ use dns_metrics::Metrics;
 use dns_proto::message::{
     CLASS_ANY, CLASS_CH, CLASS_IN, Message, RCODE_FORMERR, RCODE_NOTIMP, RCODE_NXDOMAIN,
     Question, RCODE_REFUSED, RCODE_SERVFAIL, RData, Record, TYPE_A, TYPE_AAAA, TYPE_ANY,
-    TYPE_AXFR, TYPE_DNSKEY, TYPE_IXFR, TYPE_SOA, TYPE_TXT,
+    TYPE_AXFR, TYPE_DNSKEY, TYPE_IXFR, TYPE_NSEC3PARAM, TYPE_SOA, TYPE_TXT,
 };
 use dns_proto::name::DnsName;
 use dns_zone::Zone;
@@ -41,6 +43,8 @@ pub struct Resolver {
     rpz: RwLock<Arc<Rpz>>,
     /// DNSSEC-signed material by zone origin (empty when unsigned).
     signed: RwLock<Arc<HashMap<DnsName, Arc<SignedZone>>>>,
+    /// Validating-resolver engine (set when DNSSEC validation is enabled).
+    validator: Option<Validator>,
     cache: Cache,
     flight: Singleflight,
     metrics: Arc<Metrics>,
@@ -54,6 +58,8 @@ pub struct ResolverOptions {
     pub cache_size: usize,
     pub rpz: Rpz,
     pub signed: HashMap<DnsName, Arc<SignedZone>>,
+    /// Enable DNSSEC validation of forwarded answers (root trust anchor).
+    pub validate: bool,
 }
 
 /// Result of the synchronous resolution attempt.
@@ -84,6 +90,7 @@ impl Resolver {
                 .collect(),
             rpz: RwLock::new(Arc::new(opts.rpz)),
             signed: RwLock::new(Arc::new(opts.signed)),
+            validator: opts.validate.then(Validator::with_root),
             cache: Cache::new(opts.cache_size.max(1)),
             flight: Singleflight::default(),
             metrics,
@@ -95,20 +102,24 @@ impl Resolver {
         *self.signed.write().unwrap() = Arc::new(signed);
     }
 
-    /// (Re)sign the given origins with `key` over the current zone data.
+    /// (Re)sign the given origins with `keys` over the current zone data.
     /// Called at startup, on SIGHUP, and after API edits so RRSIGs stay fresh.
     pub fn resign(
         &self,
-        key: &dns_dnssec::DnssecKey,
+        keys: &[dns_dnssec::DnssecKey],
         origins: &[DnsName],
         now: u64,
         validity_secs: u64,
+        nsec3: Option<dns_dnssec::nsec3::Nsec3Params>,
     ) {
         let zones = self.zones();
         let mut map = HashMap::new();
         for origin in origins {
             if let Some(zone) = zones.iter().find(|z| z.origin == *origin) {
-                map.insert(origin.clone(), Arc::new(SignedZone::sign(zone, key, now, validity_secs)));
+                map.insert(
+                    origin.clone(),
+                    Arc::new(SignedZone::sign(zone, keys, now, validity_secs, nsec3.clone())),
+                );
             }
         }
         self.set_signed(map);
@@ -225,10 +236,20 @@ impl Resolver {
             // Apex DNSKEY is synthesized from the signing key, not zone data.
             if q.qtype == TYPE_DNSKEY && q.qname == zone.origin {
                 if let Some(sz) = &dnssec {
-                    let (rrset, rrsig) = sz.dnskey_records();
+                    let (rrset, rrsigs) = sz.dnskey_records();
                     resp.answers.extend(rrset.iter().cloned());
-                    resp.answers.push(rrsig.clone());
+                    resp.answers.extend(rrsigs.iter().cloned());
                     return Outcome::Done(resp);
+                }
+            }
+            // NSEC3PARAM is likewise synthesized from the signing config.
+            if q.qtype == TYPE_NSEC3PARAM && q.qname == zone.origin {
+                if let Some(sz) = &dnssec {
+                    if let Some(rec) = sz.nsec3param() {
+                        resp.answers.push(rec.clone());
+                        resp.answers.extend(sz.rrsigs_for(&zone.origin, TYPE_NSEC3PARAM).iter().cloned());
+                        return Outcome::Done(resp);
+                    }
                 }
             }
 
@@ -307,7 +328,17 @@ impl Resolver {
     /// Complete a pending response with upstream traffic.
     pub async fn resolve_pending(&self, mut p: Pending) -> Message {
         match self.resolve_external(&p.target, p.qtype).await {
-            Ok(hit) => merge(&mut p.resp, hit, p.append),
+            Ok((rcode, answers, authorities, secure)) => {
+                merge(&mut p.resp, (rcode, answers, authorities), p.append);
+                // AD is only meaningful when the client can do DNSSEC (RFC
+                // 6840 §5.7): we set it on securely-validated answers.
+                p.resp.flags.ad = secure;
+            }
+            Err(ForwardError::Bogus) => {
+                Metrics::inc(&self.metrics.upstream_failures);
+                warn!("bogus DNSSEC answer for {} — returning SERVFAIL", p.target);
+                p.resp.flags.rcode = RCODE_SERVFAIL;
+            }
             Err(e) => {
                 // All upstreams down: serve stale cache data if we have any
                 // (RFC 8767) before giving up with SERVFAIL.
@@ -333,22 +364,36 @@ impl Resolver {
         hit
     }
 
-    /// Cache-through, singleflight-deduplicated upstream lookup.
+    /// Cache-through, singleflight-deduplicated upstream lookup. The `bool` is
+    /// the DNSSEC security status (true = Secure) when validation is enabled.
     async fn resolve_external(
         &self,
         qname: &DnsName,
         qtype: u16,
-    ) -> Result<(u8, Vec<Record>, Vec<Record>), ForwardError> {
+    ) -> Result<(u8, Vec<Record>, Vec<Record>, bool), ForwardError> {
         let key = Key { qname: qname.clone(), qtype };
         for _ in 0..3 {
-            if let Some(hit) = self.cache_get(&key) {
-                return Ok(hit);
+            if let Some((rcode, answers, authorities)) = self.cache_get(&key) {
+                return Ok((rcode, answers, authorities, false));
             }
             match self.flight.begin(&key) {
                 Role::Leader(_guard) => {
                     Metrics::inc(&self.metrics.cache_misses);
                     let pool = self.pool_for(qname).ok_or(ForwardError::NoUpstream)?;
-                    let msg = pool.query(qname, qtype, &self.metrics).await?;
+
+                    // With validation on, fetch with DO=1 and check the chain.
+                    let (msg, secure) = match &self.validator {
+                        Some(v) => {
+                            let m = pool.query_dnssec(qname, qtype, &self.metrics).await?;
+                            match v.validate(pool, &self.metrics, &m).await {
+                                Security::Bogus => return Err(ForwardError::Bogus),
+                                Security::Secure => (m, true),
+                                Security::Insecure => (m, false),
+                            }
+                        }
+                        None => (pool.query(qname, qtype, &self.metrics).await?, false),
+                    };
+
                     // Keep only the SOA from the authority section — it is
                     // what negative answers need; referral NS sets are noise.
                     let authorities: Vec<Record> = msg
@@ -363,7 +408,7 @@ impl Resolver {
                         msg.answers.clone(),
                         authorities.clone(),
                     );
-                    return Ok((msg.flags.rcode, msg.answers, authorities));
+                    return Ok((msg.flags.rcode, msg.answers, authorities, secure));
                 }
                 Role::Follower(mut rx) => {
                     Metrics::inc(&self.metrics.singleflight_merged);
@@ -376,7 +421,7 @@ impl Resolver {
         // Leaders kept failing with uncacheable results; go direct.
         let pool = self.pool_for(qname).ok_or(ForwardError::NoUpstream)?;
         let msg = pool.query(qname, qtype, &self.metrics).await?;
-        Ok((msg.flags.rcode, msg.answers, Vec::new()))
+        Ok((msg.flags.rcode, msg.answers, Vec::new(), false))
     }
 }
 
@@ -411,27 +456,16 @@ fn attach_dnssec(resp: &mut Message, q: &Question, zone: &Zone, sz: &SignedZone,
         if signed_sets.contains(&(owner.clone(), rtype)) {
             continue;
         }
-        if let Some(rrsig) = sz.rrsig_for(&owner, rtype) {
-            resp.answers.push(rrsig.clone());
-        }
+        resp.answers.extend(sz.rrsigs_for(&owner, rtype).iter().cloned());
         signed_sets.push((owner, rtype));
     }
 
     if negative {
         // Sign the SOA that lookup put in the authority section.
-        if let Some(rrsig) = sz.rrsig_for(&zone.origin, TYPE_SOA) {
-            resp.authorities.push(rrsig.clone());
-        }
-        let nsec = if resp.flags.rcode == RCODE_NXDOMAIN {
-            sz.covering_nsec(&q.qname)
-        } else {
-            // NODATA: the name exists, prove the type is absent.
-            sz.exact_nsec(&q.qname).or_else(|| sz.covering_nsec(&q.qname))
-        };
-        if let Some((nsec, rrsig)) = nsec {
-            resp.authorities.push(nsec.clone());
-            resp.authorities.push(rrsig.clone());
-        }
+        resp.authorities.extend(sz.rrsigs_for(&zone.origin, TYPE_SOA).iter().cloned());
+        // NSEC or NSEC3 authenticated denial (RFC 4035 / 5155).
+        let nxdomain = resp.flags.rcode == RCODE_NXDOMAIN;
+        resp.authorities.extend(sz.denial_records(&q.qname, nxdomain));
     }
 }
 

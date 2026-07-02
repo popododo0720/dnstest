@@ -191,7 +191,7 @@ impl Zone {
     }
 
     /// Replace (or create) the rrset for (name, rtype) with the given
-    /// contents, PowerDNS `changetype: REPLACE` semantics.
+    /// contents (REPLACE changetype semantics).
     pub fn replace_rrset(
         &mut self,
         name: &DnsName,
@@ -240,7 +240,7 @@ impl Zone {
         Ok(())
     }
 
-    /// Remove the rrset for (name, rtype), PowerDNS `changetype: DELETE`.
+    /// Remove the rrset for (name, rtype) (DELETE changetype).
     pub fn delete_rrset(&mut self, name: &DnsName, rtype: &str) -> Result<(), String> {
         let code = type_code(rtype).ok_or_else(|| format!("unsupported type '{rtype}'"))?;
         if code == TYPE_SOA {

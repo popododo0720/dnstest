@@ -43,6 +43,9 @@ tokio-rustls = "0.26"
 rcgen = "0.14"
 base64 = "0.22"
 rustls-pemfile = "2"
+h2 = "0.4"
+http = "1"
+bytes = "1"
 
 [profile.release]
 lto = "thin"

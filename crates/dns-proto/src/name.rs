@@ -47,6 +47,19 @@ impl DnsName {
         &self.labels
     }
 
+    pub fn is_root(&self) -> bool {
+        self.labels.is_empty()
+    }
+
+    /// The parent zone (this name minus its first label); None for the root.
+    pub fn parent(&self) -> Option<DnsName> {
+        if self.labels.is_empty() {
+            None
+        } else {
+            Some(DnsName { labels: self.labels[1..].to_vec() })
+        }
+    }
+
     pub fn label_count(&self) -> usize {
         self.labels.len()
     }

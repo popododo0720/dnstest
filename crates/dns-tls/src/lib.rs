@@ -12,19 +12,23 @@ use tokio_rustls::TlsAcceptor;
 
 /// Build a TLS acceptor from PEM cert+key files, or generate a self-signed
 /// certificate for the given DNS names when no files are provided (dev/lab).
+/// `alpn` sets the advertised protocols (e.g. `[b"h2", b"http/1.1"]` for DoH;
+/// empty for DoT, which does not require ALPN).
 pub fn acceptor(
     cert_path: Option<&Path>,
     key_path: Option<&Path>,
     self_signed_names: &[String],
+    alpn: &[&[u8]],
 ) -> Result<TlsAcceptor, String> {
     let (certs, key) = match (cert_path, key_path) {
         (Some(c), Some(k)) => load_pem(c, k)?,
         _ => generate_self_signed(self_signed_names)?,
     };
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| format!("tls config: {e}"))?;
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
@@ -138,7 +142,8 @@ mod tests {
 
     #[test]
     fn self_signed_acceptor_builds() {
-        assert!(acceptor(None, None, &["dns.example".into()]).is_ok());
+        assert!(acceptor(None, None, &["dns.example".into()], &[]).is_ok());
+        assert!(acceptor(None, None, &["dns.example".into()], &[b"h2", b"http/1.1"]).is_ok());
     }
 
     #[test]

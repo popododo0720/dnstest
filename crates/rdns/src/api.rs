@@ -1,4 +1,4 @@
-//! PowerDNS-style management REST API.
+//! Management REST API for zones and records.
 //!
 //! ```text
 //! GET    /api/v1/zones             list zones
@@ -40,8 +40,13 @@ pub struct ApiCtx {
     pub notify_targets: Vec<std::net::SocketAddr>,
     /// Change journal, for IXFR after API edits.
     pub journal: Arc<dns_xfr::Journal>,
-    /// DNSSEC signer + origins + validity; re-signs edited zones.
-    pub dnssec: Option<(Arc<dns_dnssec::DnssecKey>, Vec<DnsName>, u64)>,
+    /// DNSSEC signers + origins + validity + NSEC3 params; re-signs edits.
+    pub dnssec: Option<(
+        Arc<Vec<dns_dnssec::DnssecKey>>,
+        Vec<DnsName>,
+        u64,
+        Option<dns_dnssec::nsec3::Nsec3Params>,
+    )>,
     /// Serializes writers; readers work on lock-free snapshots.
     pub write_lock: tokio::sync::Mutex<()>,
 }
@@ -59,9 +64,9 @@ fn after_change(ctx: &ApiCtx, old: Option<&Zone>, new: &Zone) {
     if let Some(old) = old {
         ctx.journal.record(old, new);
     }
-    if let Some((key, origins, validity)) = &ctx.dnssec {
+    if let Some((keys, origins, validity, nsec3)) = &ctx.dnssec {
         if origins.contains(&new.origin) {
-            ctx.resolver.resign(key, origins, unix_now(), *validity);
+            ctx.resolver.resign(keys, origins, unix_now(), *validity, nsec3.clone());
         }
     }
 }

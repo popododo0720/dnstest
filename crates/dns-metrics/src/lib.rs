@@ -1,5 +1,5 @@
 //! Server statistics: lock-free counters exposed through the management API
-//! (`GET /api/v1/statistics`), PowerDNS-style.
+//! (`GET /api/v1/statistics`).
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};

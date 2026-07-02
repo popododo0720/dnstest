@@ -16,6 +16,8 @@ pub struct Config {
     pub zones: Vec<PathBuf>,
     /// Directory of `*.zone` files; also where API changes are persisted.
     pub zone_dir: Option<PathBuf>,
+    /// Directory for persistent IXFR journals (survives restart).
+    pub journal_dir: Option<PathBuf>,
     /// Log every query at info level.
     pub query_log: bool,
     pub recursion: Recursion,
@@ -46,6 +48,7 @@ impl Default for Config {
             workers: 0,
             zones: Vec::new(),
             zone_dir: None,
+            journal_dir: None,
             query_log: true,
             recursion: Recursion::default(),
             cache: CacheCfg::default(),
@@ -101,13 +104,30 @@ fn default_tsig_alg() -> String {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DnssecCfg {
-    /// File holding the Ed25519 seed (base64). Auto-generated if missing.
+    /// File holding the signing key material (`alg:base64`). Auto-generated if
+    /// missing. Multiple lines = multiple keys (KSK/ZSK, rollover).
     pub key_file: Option<PathBuf>,
     /// Zone origins to sign online.
     pub zones: Vec<String>,
     /// Signature validity window in days.
     #[serde(default = "default_validity_days")]
     pub validity_days: u64,
+    /// Signing algorithm for auto-generated keys: "ecdsap256" or "ed25519".
+    #[serde(default = "default_dnssec_alg")]
+    pub algorithm: String,
+    /// Use NSEC3 hashed denial instead of NSEC.
+    #[serde(default)]
+    pub nsec3: bool,
+    /// NSEC3 hash iterations.
+    #[serde(default)]
+    pub nsec3_iterations: u16,
+    /// NSEC3 salt as hex (empty = no salt).
+    #[serde(default)]
+    pub nsec3_salt: String,
+}
+
+fn default_dnssec_alg() -> String {
+    "ecdsap256".into()
 }
 
 fn default_validity_days() -> u64 {
@@ -163,6 +183,9 @@ pub struct Recursion {
     pub upstreams: Vec<SocketAddr>,
     /// Client networks allowed to use recursion (open-resolver protection).
     pub allow: Vec<String>,
+    /// Validate forwarded answers against the DNSSEC root trust anchor.
+    #[serde(default)]
+    pub validate: bool,
 }
 
 impl Default for Recursion {
@@ -171,6 +194,7 @@ impl Default for Recursion {
             enabled: true,
             upstreams: vec!["1.1.1.1:53".parse().unwrap(), "8.8.8.8:53".parse().unwrap()],
             allow: vec!["127.0.0.0/8".into(), "::1/128".into()],
+            validate: false,
         }
     }
 }

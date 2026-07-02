@@ -183,7 +183,8 @@ pub async fn run_dot(
     }
 }
 
-/// DNS-over-HTTPS (RFC 8484): TLS + minimal HTTP/1.1, GET/POST /dns-query.
+/// DNS-over-HTTPS (RFC 8484): TLS with ALPN, then HTTP/2 (`h2`) or HTTP/1.1
+/// depending on what the client negotiated. GET/POST /dns-query.
 pub async fn run_doh(
     listener: TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
@@ -194,14 +195,91 @@ pub async fn run_doh(
         let acceptor = acceptor.clone();
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            match acceptor.accept(stream).await {
-                Ok(tls) => {
-                    let _ = serve_doh_conn(tls, peer, ctx).await;
+            let tls = match acceptor.accept(stream).await {
+                Ok(t) => t,
+                Err(e) => {
+                    debug!("doh {peer}: tls handshake failed: {e}");
+                    return;
                 }
-                Err(e) => debug!("doh {peer}: tls handshake failed: {e}"),
+            };
+            let is_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+            if is_h2 {
+                let _ = serve_doh_h2(tls, peer, ctx).await;
+            } else {
+                let _ = serve_doh_conn(tls, peer, ctx).await;
             }
         });
     }
+}
+
+/// HTTP/2 DoH via the `h2` crate: one DNS query per stream (RFC 8484).
+async fn serve_doh_h2<S: AsyncRead + AsyncWrite + Unpin>(
+    tls: S,
+    peer: SocketAddr,
+    ctx: Arc<ServerCtx>,
+) -> Result<(), h2::Error> {
+    let mut conn = h2::server::handshake(tls).await?;
+    while let Some(request) = conn.accept().await {
+        let (req, mut respond) = match request {
+            Ok(rs) => rs,
+            Err(e) => {
+                debug!("doh/h2 {peer}: stream error: {e}");
+                break;
+            }
+        };
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let _ = handle_h2_request(req, &mut respond, &ctx, peer).await;
+        });
+    }
+    Ok(())
+}
+
+async fn handle_h2_request(
+    req: http::Request<h2::RecvStream>,
+    respond: &mut h2::server::SendResponse<bytes::Bytes>,
+    ctx: &ServerCtx,
+    peer: SocketAddr,
+) -> Result<(), h2::Error> {
+    // Reconstruct the request head as "METHOD target" for the shared DoH
+    // parser, then collect the POST body from the stream.
+    let method = req.method().clone();
+    let path_and_query =
+        req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
+    let head = format!("{method} {path_and_query} HTTP/2");
+
+    let mut body = Vec::new();
+    let mut recv = req.into_body();
+    while let Some(chunk) = recv.data().await {
+        let chunk = chunk?;
+        let _ = recv.flow_control().release_capacity(chunk.len());
+        body.extend_from_slice(&chunk);
+        if body.len() > 65535 {
+            break;
+        }
+    }
+
+    Metrics::inc(&ctx.metrics.queries_tcp);
+    match dns_tls::parse_doh(&head, &body) {
+        Some(r) => {
+            let started = Instant::now();
+            let dns = handle_query_bytes(ctx, &r.dns, peer, "doh", started).await;
+            let response = http::Response::builder()
+                .status(200)
+                .header("content-type", "application/dns-message")
+                .header("content-length", dns.len().to_string())
+                .header("cache-control", "max-age=0")
+                .body(())
+                .unwrap();
+            let mut stream = respond.send_response(response, false)?;
+            stream.send_data(bytes::Bytes::from(dns), true)?;
+        }
+        None => {
+            let response = http::Response::builder().status(404).body(()).unwrap();
+            respond.send_response(response, true)?;
+        }
+    }
+    Ok(())
 }
 
 async fn serve_doh_conn<S: AsyncRead + AsyncWrite + Unpin>(

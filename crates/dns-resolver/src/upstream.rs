@@ -23,6 +23,8 @@ pub enum ForwardError {
     Io(std::io::Error),
     Timeout,
     NoUpstream,
+    /// DNSSEC validation failed — the answer is forged or the chain is broken.
+    Bogus,
 }
 
 impl fmt::Display for ForwardError {
@@ -31,6 +33,7 @@ impl fmt::Display for ForwardError {
             ForwardError::Io(e) => write!(f, "i/o error: {e}"),
             ForwardError::Timeout => write!(f, "upstream timed out"),
             ForwardError::NoUpstream => write!(f, "no upstream configured"),
+            ForwardError::Bogus => write!(f, "DNSSEC validation failed (bogus)"),
         }
     }
 }
@@ -65,12 +68,32 @@ impl UpstreamPool {
         qtype: u16,
         metrics: &Metrics,
     ) -> Result<Message, ForwardError> {
+        self.query_inner(qname, qtype, metrics, false).await
+    }
+
+    /// Like [`query`], but sets the DNSSEC OK bit so RRSIGs are returned.
+    pub async fn query_dnssec(
+        &self,
+        qname: &DnsName,
+        qtype: u16,
+        metrics: &Metrics,
+    ) -> Result<Message, ForwardError> {
+        self.query_inner(qname, qtype, metrics, true).await
+    }
+
+    async fn query_inner(
+        &self,
+        qname: &DnsName,
+        qtype: u16,
+        metrics: &Metrics,
+        dnssec: bool,
+    ) -> Result<Message, ForwardError> {
         let start = self.preferred.load(Relaxed);
         let mut last = ForwardError::NoUpstream;
         for i in 0..self.addrs.len() {
             let idx = (start + i) % self.addrs.len();
             Metrics::inc(&metrics.upstream_queries);
-            match forward_query(self.addrs[idx], qname, qtype).await {
+            match forward_query(self.addrs[idx], qname, qtype, dnssec).await {
                 Ok(m) => {
                     if i > 0 {
                         self.preferred.store(idx, Relaxed);
@@ -94,12 +117,18 @@ async fn forward_query(
     upstream: SocketAddr,
     qname: &DnsName,
     qtype: u16,
+    dnssec: bool,
 ) -> Result<Message, ForwardError> {
-    let mut query = Message::new(random_id(), Flags { rd: true, ..Flags::default() });
+    // Set CD when we validate ourselves, so the upstream returns the raw
+    // (possibly bogus) RRSIGs instead of filtering them with its own policy.
+    let mut query =
+        Message::new(random_id(), Flags { rd: true, cd: dnssec, ..Flags::default() });
     query
         .questions
         .push(Question { qname: qname.clone(), qtype, qclass: CLASS_IN });
-    query.edns = Some(Edns::ours());
+    let mut edns = Edns::ours();
+    edns.do_bit = dnssec;
+    query.edns = Some(edns);
     let wire = query.encode();
 
     let mut last_err = ForwardError::Timeout;

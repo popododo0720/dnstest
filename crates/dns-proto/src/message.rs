@@ -49,6 +49,8 @@ pub const TYPE_DS: u16 = 43;
 pub const TYPE_RRSIG: u16 = 46;
 pub const TYPE_NSEC: u16 = 47;
 pub const TYPE_DNSKEY: u16 = 48;
+pub const TYPE_NSEC3: u16 = 50;
+pub const TYPE_NSEC3PARAM: u16 = 51;
 pub const TYPE_IXFR: u16 = 251;
 pub const TYPE_AXFR: u16 = 252;
 pub const TYPE_TSIG: u16 = 250;
@@ -76,6 +78,8 @@ pub fn type_name(t: u16) -> String {
         TYPE_RRSIG => "RRSIG".into(),
         TYPE_NSEC => "NSEC".into(),
         TYPE_DNSKEY => "DNSKEY".into(),
+        TYPE_NSEC3 => "NSEC3".into(),
+        TYPE_NSEC3PARAM => "NSEC3PARAM".into(),
         TYPE_IXFR => "IXFR".into(),
         TYPE_AXFR => "AXFR".into(),
         TYPE_TSIG => "TSIG".into(),

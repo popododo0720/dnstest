@@ -73,12 +73,40 @@ struct Diff {
 }
 
 /// Per-zone change history enabling incremental transfers (RFC 1995).
+///
+/// When a directory is configured the log is also appended to
+/// `<origin>journal` on disk so IXFR survives restarts. The on-disk format is
+/// a line-oriented text journal (one delta per `DELTA…END` block), which
+/// round-trips through the same record text encoding zone files use.
 #[derive(Default)]
 pub struct Journal {
     zones: Mutex<HashMap<DnsName, VecDeque<Diff>>>,
+    dir: Option<std::path::PathBuf>,
 }
 
 impl Journal {
+    /// A journal that persists to `dir`, loading any existing history.
+    pub fn with_dir(dir: std::path::PathBuf) -> Self {
+        let mut zones: HashMap<DnsName, VecDeque<Diff>> = HashMap::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "journal") {
+                    if let Some((origin, diffs)) = load_journal_file(&path) {
+                        zones.insert(origin, diffs);
+                    }
+                }
+            }
+        }
+        Journal { zones: Mutex::new(zones), dir: Some(dir) }
+    }
+
+    fn journal_path(&self, origin: &DnsName) -> Option<std::path::PathBuf> {
+        let stem = origin.to_string();
+        let stem = stem.trim_end_matches('.');
+        self.dir.as_ref().map(|d| d.join(format!("{stem}.journal")))
+    }
+
     /// Record the change from `old` to `new` (called after every edit).
     pub fn record(&self, old: &Zone, new: &Zone) {
         let (from, to) = (zone_serial(old), zone_serial(new));
@@ -91,10 +119,17 @@ impl Journal {
             old_recs.iter().filter(|r| !new_recs.contains(r)).cloned().collect();
         let added: Vec<Record> =
             new_recs.iter().filter(|r| !old_recs.contains(r)).cloned().collect();
+        let diff = Diff { from, to, deleted, added };
+
+        if let Some(path) = self.journal_path(&new.origin) {
+            if let Err(e) = append_diff(&path, &diff) {
+                warn!("journal append for {} failed: {e}", new.origin);
+            }
+        }
 
         let mut map = self.zones.lock().unwrap();
         let log = map.entry(new.origin.clone()).or_default();
-        log.push_back(Diff { from, to, deleted, added });
+        log.push_back(diff);
         while log.len() > JOURNAL_DEPTH {
             log.pop_front();
         }
@@ -149,6 +184,71 @@ pub fn ixfr_messages(
     }
     records.push(zone.soa.clone());
     frame_transfer(records, query)
+}
+
+fn record_line(tag: &str, r: &Record) -> String {
+    format!("{tag} {} {} {} {}\n", r.name, r.ttl, dns_proto::message::type_name(r.rtype()), r.rdata.text())
+}
+
+/// Parse a `DEL`/`ADD` journal line back into a Record (origin gives relative
+/// name context, though journal names are always absolute).
+fn parse_record_line(rest: &str, origin: &DnsName) -> Option<Record> {
+    let mut it = rest.splitn(4, ' ');
+    let name = DnsName::parse_str(it.next()?).ok()?;
+    let ttl: u32 = it.next()?.parse().ok()?;
+    let rtype = it.next()?;
+    let content = it.next()?;
+    let rdata = dns_zone::rdata_from_text(rtype, content, origin).ok()?;
+    Some(Record { name, class: CLASS_IN, ttl, rdata })
+}
+
+/// Append one delta to the on-disk journal (create/append, line-buffered).
+fn append_diff(path: &std::path::Path, diff: &Diff) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut buf = String::new();
+    buf.push_str(&format!("DELTA {} {}\n", diff.from, diff.to));
+    for r in &diff.deleted {
+        buf.push_str(&record_line("DEL", r));
+    }
+    for r in &diff.added {
+        buf.push_str(&record_line("ADD", r));
+    }
+    buf.push_str("END\n");
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    f.write_all(buf.as_bytes())
+}
+
+/// Load a persisted journal file back into deltas, capped at JOURNAL_DEPTH.
+fn load_journal_file(path: &std::path::Path) -> Option<(DnsName, VecDeque<Diff>)> {
+    let stem = path.file_stem()?.to_str()?;
+    let origin = DnsName::parse_str(stem).ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut diffs = VecDeque::new();
+    let mut cur: Option<Diff> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("DELTA ") {
+            let mut it = rest.split_whitespace();
+            let from = it.next()?.parse().ok()?;
+            let to = it.next()?.parse().ok()?;
+            cur = Some(Diff { from, to, deleted: Vec::new(), added: Vec::new() });
+        } else if let Some(rest) = line.strip_prefix("DEL ") {
+            if let (Some(d), Some(r)) = (cur.as_mut(), parse_record_line(rest, &origin)) {
+                d.deleted.push(r);
+            }
+        } else if let Some(rest) = line.strip_prefix("ADD ") {
+            if let (Some(d), Some(r)) = (cur.as_mut(), parse_record_line(rest, &origin)) {
+                d.added.push(r);
+            }
+        } else if line == "END" {
+            if let Some(d) = cur.take() {
+                diffs.push_back(d);
+            }
+        }
+    }
+    while diffs.len() > JOURNAL_DEPTH {
+        diffs.pop_front();
+    }
+    Some((origin, diffs))
 }
 
 /// The zone's SOA record rewritten with a specific serial (for IXFR framing).
@@ -465,6 +565,28 @@ mod tests {
         assert_eq!(m.answers.first().unwrap().rtype(), TYPE_SOA);
         assert!(m.answers.iter().any(|r| r.rdata.text() == "10.0.0.2"));
         assert!(!m.answers.iter().any(|r| r.rdata.text() == "10.0.0.1"));
+    }
+
+    #[test]
+    fn journal_persists_across_reload() {
+        let dir = std::env::temp_dir().join(format!("rdns-jtest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let v1 = parse_zone_file("$ORIGIN t.\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\na IN A 10.0.0.1\n").unwrap();
+        let v2 = parse_zone_file("$ORIGIN t.\n@ IN SOA ns h 2 2 3 4 5\n@ IN NS ns\nb IN A 10.0.0.2\n").unwrap();
+        {
+            let j = Journal::with_dir(dir.clone());
+            j.record(&v1, &v2);
+        }
+        // A fresh Journal reloads the delta from disk and can still serve IXFR.
+        let j2 = Journal::with_dir(dir.clone());
+        let q = ixfr_query(&v2.origin, 1);
+        let frames = ixfr_messages(&v2, &q, 1, &j2);
+        let m = Message::parse(&frames[0][2..]).unwrap();
+        assert!(m.answers.iter().any(|r| r.rdata.text() == "10.0.0.1"), "reloaded deletion");
+        assert!(m.answers.iter().any(|r| r.rdata.text() == "10.0.0.2"), "reloaded addition");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

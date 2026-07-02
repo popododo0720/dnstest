@@ -4,12 +4,14 @@ listen = "127.0.0.1:5300"
 workers = 0            # 0 = one UDP worker per CPU core
 zone_dir = "zones"     # *.zone files here are served; API changes persist here
 zones = []             # extra zone files outside zone_dir
+journal_dir = "journal"  # persistent IXFR journals (survive restart)
 query_log = true       # per-query info logs; turn off under load
 
 [recursion]
 enabled = true
 upstreams = ["1.1.1.1:53", "8.8.8.8:53"]   # failover order
 allow = ["127.0.0.0/8", "10.0.0.0/8", "192.168.0.0/16", "::1/128"]
+validate = false       # true = DNSSEC-validate forwarded answers (root anchor)
 
 [cache]
 max_entries = 100000
@@ -50,11 +52,15 @@ notify = []                    # secondaries to NOTIFY on zone change
 # Sign inbound transfers on a secondary:
 # secondary.tsig_key = "xfrkey."
 
-# --- DNSSEC online signing (Ed25519, RFC 8080) ---
+# --- DNSSEC online signing ---
 [dnssec]
-# key_file = "ksk.seed"            # 32-byte Ed25519 seed (base64); auto-generated
+# key_file = "dnssec.keys"         # `alg:base64` lines (ksk/zsk); auto-generated
 # zones = ["example.lab."]         # origins to sign online
+# algorithm = "ecdsap256"          # or "ed25519" (for auto-generated keys)
 # validity_days = 14
+# nsec3 = false                    # true = NSEC3 hashed denial instead of NSEC
+# nsec3_iterations = 0
+# nsec3_salt = ""                  # hex
 
 # --- DNS-over-TLS (RFC 7858) and DNS-over-HTTPS (RFC 8484) ---
 [tls]
@@ -62,4 +68,4 @@ notify = []                    # secondaries to NOTIFY on zone change
 # key = "key.pem"
 # self_signed_names = ["dns.example.lab"]
 # dot_listen = "0.0.0.0:853"
-# doh_listen = "0.0.0.0:443"       # HTTP/1.1; use curl/POST or GET ?dns=
+# doh_listen = "0.0.0.0:443"       # HTTP/2 (ALPN h2) + HTTP/1.1
