@@ -459,11 +459,57 @@ pub struct Edns {
     pub options: Vec<u8>,
 }
 
+/// EDNS option code for DNS Cookies (RFC 7873).
+pub const EDNS_COOKIE: u16 = 10;
+
 impl Edns {
     /// The OPT record this server attaches to its own messages. 1232 bytes is
     /// the DNS-flag-day-2020 recommendation (fits any sane MTU unfragmented).
     pub fn ours() -> Self {
         Edns { udp_payload: 1232, ext_rcode: 0, version: 0, do_bit: false, options: Vec::new() }
+    }
+
+    /// The value of EDNS option `code`, if present. Options are a sequence of
+    /// (code: u16, len: u16, data) triples in the OPT rdata.
+    pub fn get_option(&self, code: u16) -> Option<&[u8]> {
+        let mut i = 0;
+        while i + 4 <= self.options.len() {
+            let c = u16::from_be_bytes([self.options[i], self.options[i + 1]]);
+            let len = u16::from_be_bytes([self.options[i + 2], self.options[i + 3]]) as usize;
+            let start = i + 4;
+            let end = start.checked_add(len)?;
+            if end > self.options.len() {
+                break;
+            }
+            if c == code {
+                return Some(&self.options[start..end]);
+            }
+            i = end;
+        }
+        None
+    }
+
+    /// Add or replace an EDNS option.
+    pub fn set_option(&mut self, code: u16, data: &[u8]) {
+        self.remove_option(code);
+        self.options.extend_from_slice(&code.to_be_bytes());
+        self.options.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        self.options.extend_from_slice(data);
+    }
+
+    pub fn remove_option(&mut self, code: u16) {
+        let mut out = Vec::with_capacity(self.options.len());
+        let mut i = 0;
+        while i + 4 <= self.options.len() {
+            let c = u16::from_be_bytes([self.options[i], self.options[i + 1]]);
+            let len = u16::from_be_bytes([self.options[i + 2], self.options[i + 3]]) as usize;
+            let end = (i + 4 + len).min(self.options.len());
+            if c != code {
+                out.extend_from_slice(&self.options[i..end]);
+            }
+            i = end;
+        }
+        self.options = out;
     }
 }
 

@@ -78,44 +78,70 @@ impl Recursor {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Message, ForwardError>> + Send + 'a>>
     {
         Box::pin(async move {
-            let current = qname.clone();
             let mut cnames = 0;
+            let full_labels = qname.label_count();
+            let mut servers = self.roots.clone();
+            // Labels of the zone we are currently talking to (root = 0). The
+            // next query reveals exactly one more label (QNAME minimization,
+            // RFC 9156) until we reach the full name.
+            let mut zone_depth = 0usize;
+            let mut minimize = true;
 
-            'restart: loop {
-                let mut servers = self.roots.clone();
-                for _ in 0..MAX_REFERRALS {
-                    let resp = match self.query_servers(&servers, &current, qtype, metrics).await {
-                        Some(r) => r,
-                        None => return Err(ForwardError::Timeout),
-                    };
+            for _ in 0..MAX_REFERRALS {
+                let keep = if minimize { (zone_depth + 1).min(full_labels) } else { full_labels };
+                let is_full = keep == full_labels;
+                let min_name = suffix(qname, keep);
+                // Intermediate steps probe with NS (privacy); the last with the
+                // real type.
+                let step_type = if is_full { qtype } else { TYPE_NS };
 
-                    // Answer present?
-                    let has_answer = resp.answers.iter().any(|r| {
-                        r.name == current && (r.rtype() == qtype || r.rtype() == TYPE_CNAME)
-                    });
+                let resp = match self.query_servers(&servers, &min_name, step_type, metrics).await {
+                    Some(r) => r,
+                    None => return Err(ForwardError::Timeout),
+                };
+
+                // Referral (NS in authority for a name at/under min_name)?
+                let ns_owner = resp
+                    .authorities
+                    .iter()
+                    .find(|r| r.rtype() == TYPE_NS)
+                    .map(|r| r.name.clone());
+                let ns_names: Vec<DnsName> = resp
+                    .authorities
+                    .iter()
+                    .filter(|r| r.rtype() == TYPE_NS)
+                    .filter_map(|r| match &r.rdata {
+                        RData::Ns(n) => Some(n.clone()),
+                        _ => None,
+                    })
+                    .collect();
+
+                // A real answer only counts on the full-name query.
+                if is_full {
+                    let has_answer = resp
+                        .answers
+                        .iter()
+                        .any(|r| r.name == *qname && (r.rtype() == qtype || r.rtype() == TYPE_CNAME));
                     if has_answer {
-                        // Follow a CNAME if the target type differs.
                         if qtype != TYPE_CNAME {
                             if let Some(target) = resp
                                 .answers
                                 .iter()
-                                .find(|r| r.name == current && r.rtype() == TYPE_CNAME)
+                                .find(|r| r.name == *qname && r.rtype() == TYPE_CNAME)
                                 .and_then(|r| match &r.rdata {
                                     RData::Cname(t) => Some(t.clone()),
                                     _ => None,
                                 })
                             {
-                                // If the final type is already in the answer, we're done.
-                                let resolved =
-                                    resp.answers.iter().any(|r| r.rtype() == qtype);
+                                let resolved = resp.answers.iter().any(|r| r.rtype() == qtype);
                                 if !resolved {
                                     cnames += 1;
                                     if cnames > MAX_CNAMES {
                                         return Err(ForwardError::Timeout);
                                     }
-                                    // Merge the CNAME record into a fresh chase.
-                                    let mut chased =
-                                        self.resolve_depth(&target, qtype, metrics, glueless_depth).await?;
+                                    let mut chased = self
+                                        .resolve_depth(&target, qtype, metrics, glueless_depth)
+                                        .await?;
                                     let mut answers = resp.answers.clone();
                                     answers.append(&mut chased.answers);
                                     chased.answers = answers;
@@ -130,66 +156,77 @@ impl Recursor {
                         }
                         return Ok(finalize(resp, qname, qtype));
                     }
-
-                    // Referral: NS records in the authority section.
-                    let ns_names: Vec<DnsName> = resp
-                        .authorities
-                        .iter()
-                        .filter(|r| r.rtype() == TYPE_NS)
-                        .filter_map(|r| match &r.rdata {
-                            RData::Ns(n) => Some(n.clone()),
-                            _ => None,
-                        })
-                        .collect();
                     if ns_names.is_empty() {
-                        // Authoritative negative or empty answer: return as-is.
-                        return Ok(finalize(resp, qname, qtype));
+                        return Ok(finalize(resp, qname, qtype)); // authoritative negative
                     }
-
-                    // Glue: A/AAAA for the referral's NS names in additionals.
-                    let mut next: Vec<SocketAddr> = resp
-                        .additionals
-                        .iter()
-                        .filter(|r| ns_names.contains(&r.name))
-                        .filter_map(|r| match &r.rdata {
-                            RData::A(ip) => Some(SocketAddr::new((*ip).into(), 53)),
-                            RData::Aaaa(ip) => Some(SocketAddr::new((*ip).into(), 53)),
-                            _ => None,
-                        })
-                        .collect();
-
-                    // Glueless delegation: resolve one NS name's address.
-                    if next.is_empty() {
-                        if glueless_depth >= MAX_GLUELESS_DEPTH {
-                            return Err(ForwardError::Timeout);
-                        }
-                        for ns in &ns_names {
-                            if let Ok(m) =
-                                self.resolve_depth(ns, TYPE_A, metrics, glueless_depth + 1).await
-                            {
-                                next.extend(m.answers.iter().filter_map(|r| match &r.rdata {
-                                    RData::A(ip) => Some(SocketAddr::new((*ip).into(), 53)),
-                                    _ => None,
-                                }));
-                                if !next.is_empty() {
-                                    break;
-                                }
-                            }
-                        }
-                        if next.is_empty() {
-                            return Err(ForwardError::Timeout);
-                        }
-                    }
-                    servers = next;
                 }
-                // Exceeded referral budget without resolving; restart is a
-                // last resort but bounded by the CNAME counter above.
-                if cnames == 0 {
-                    return Err(ForwardError::Timeout);
+
+                if !ns_names.is_empty() {
+                    // Descend into the delegation. The new zone cut is the NS
+                    // owner's depth (or at least one deeper than now).
+                    let new_depth = ns_owner.map(|n| n.label_count()).unwrap_or(keep);
+                    zone_depth = new_depth.max(zone_depth + 1);
+                    servers = match self.referral_addrs(&resp, &ns_names, glueless_depth, metrics).await
+                    {
+                        Some(s) => s,
+                        None => return Err(ForwardError::Timeout),
+                    };
+                    continue;
                 }
-                continue 'restart;
+
+                // No referral and not a final answer: a minimized intermediate
+                // query. NXDOMAIN here may be an empty-non-terminal false
+                // negative (RFC 9156 §4) — fall back to the full name; a
+                // NODATA means the ENT exists, so reveal one more label.
+                if resp.flags.rcode == dns_proto::message::RCODE_NXDOMAIN {
+                    minimize = false;
+                    continue;
+                }
+                zone_depth += 1;
+                if zone_depth >= full_labels {
+                    minimize = false; // next query is the full name
+                }
             }
+            Err(ForwardError::Timeout)
         })
+    }
+
+    /// Resolve the addresses to talk to for a referral, using glue or, when
+    /// glueless, resolving an NS name's A record.
+    async fn referral_addrs(
+        &self,
+        resp: &Message,
+        ns_names: &[DnsName],
+        glueless_depth: usize,
+        metrics: &Metrics,
+    ) -> Option<Vec<SocketAddr>> {
+        let mut next: Vec<SocketAddr> = resp
+            .additionals
+            .iter()
+            .filter(|r| ns_names.contains(&r.name))
+            .filter_map(|r| match &r.rdata {
+                RData::A(ip) => Some(SocketAddr::new((*ip).into(), 53)),
+                RData::Aaaa(ip) => Some(SocketAddr::new((*ip).into(), 53)),
+                _ => None,
+            })
+            .collect();
+        if next.is_empty() {
+            if glueless_depth >= MAX_GLUELESS_DEPTH {
+                return None;
+            }
+            for ns in ns_names {
+                if let Ok(m) = self.resolve_depth(ns, TYPE_A, metrics, glueless_depth + 1).await {
+                    next.extend(m.answers.iter().filter_map(|r| match &r.rdata {
+                        RData::A(ip) => Some(SocketAddr::new((*ip).into(), 53)),
+                        _ => None,
+                    }));
+                    if !next.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+        (!next.is_empty()).then_some(next)
     }
 
     /// Try each server in turn until one answers.
@@ -281,6 +318,17 @@ fn finalize(mut resp: Message, qname: &DnsName, qtype: u16) -> Message {
     resp.flags.aa = false;
     resp.flags.ra = true;
     resp
+}
+
+/// The last `keep` labels of `name` (its `keep`-label suffix), for QNAME
+/// minimization. `keep >= label_count` returns the whole name.
+fn suffix(name: &DnsName, keep: usize) -> DnsName {
+    let labels = name.labels();
+    if keep >= labels.len() {
+        return name.clone();
+    }
+    let start = labels.len() - keep;
+    DnsName::from_labels(labels[start..].to_vec()).unwrap_or_else(|_| name.clone())
 }
 
 fn query_id() -> u16 {

@@ -41,6 +41,24 @@ pub struct Config {
     pub tls: Option<TlsCfg>,
     /// RFC 2136 dynamic updates.
     pub update: UpdateCfg,
+    /// DNS Cookies (RFC 7873).
+    pub cookies: CookieCfg,
+    /// Split-horizon views: client-matched zone sets, tried before `zone_dir`.
+    #[serde(rename = "view")]
+    pub views: Vec<ViewCfg>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewCfg {
+    /// Client networks this view applies to.
+    pub match_clients: Vec<String>,
+    /// Zone files served to matching clients.
+    #[serde(default)]
+    pub zones: Vec<PathBuf>,
+    /// Directory of `*.zone` files for this view.
+    #[serde(default)]
+    pub zone_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -64,7 +82,24 @@ impl Default for Config {
             dnssec: DnssecCfg::default(),
             tls: None,
             update: UpdateCfg::default(),
+            cookies: CookieCfg::default(),
+            views: Vec::new(),
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CookieCfg {
+    /// Answer with server cookies (RFC 7873).
+    pub enabled: bool,
+    /// Require a valid cookie on UDP; cookieless queries get BADCOOKIE.
+    pub require: bool,
+}
+
+impl Default for CookieCfg {
+    fn default() -> Self {
+        CookieCfg { enabled: true, require: false }
     }
 }
 
@@ -159,6 +194,8 @@ pub struct TlsCfg {
     pub dot_listen: Option<SocketAddr>,
     /// DNS-over-HTTPS listen address (RFC 8484).
     pub doh_listen: Option<SocketAddr>,
+    /// DNS-over-QUIC listen address (RFC 9250, usually :853/udp).
+    pub doq_listen: Option<SocketAddr>,
 }
 
 impl Default for TlsCfg {
@@ -169,6 +206,7 @@ impl Default for TlsCfg {
             self_signed_names: vec!["localhost".into()],
             dot_listen: None,
             doh_listen: None,
+            doq_listen: None,
         }
     }
 }

@@ -41,9 +41,10 @@ re-sign the zone when DNSSEC is enabled.
 `recursion.mode = "forward"` (default) sends cache misses to the configured
 upstreams with failover. `recursion.mode = "recursive"` instead resolves
 iteratively from the IANA root hints, following NS referrals and glue down the
-delegation tree with no upstream — a full recursive resolver. Both modes share
-the cache, singleflight, RPZ, and DNSSEC validation. Conditional forwarding
-(`[[forward]]`) overrides the mode for specific zones.
+delegation tree with no upstream — a full recursive resolver with QNAME
+minimization (RFC 9156: intermediate queries reveal only one more label at a
+time). Both modes share the cache, singleflight, RPZ, and DNSSEC validation.
+Conditional forwarding (`[[forward]]`) overrides the mode for specific zones.
 
 ## Record types
 
@@ -122,15 +123,31 @@ Verified against the live internet: valid signatures (ECDSA and RSA, including
 1024-bit ZSKs) set AD on both positive and NXDOMAIN/NODATA answers, while
 `dnssec-failed.org` and `sigfail.verteiltesysteme.net` return SERVFAIL.
 
-## DNS-over-TLS and DNS-over-HTTPS
+## Encrypted transports
 
 - **DoT** (RFC 7858): `tls.dot_listen`. Verified with `dig +tls` over TLS 1.3.
 - **DoH** (RFC 8484): `tls.doh_listen`. Serves both HTTP/2 (negotiated via ALPN
   `h2`) and HTTP/1.1; GET (`?dns=base64url`) and POST (`application/dns-message`).
   Verified with `dig +https`, `curl --http2`, and HTTP/1.1 clients.
+- **DoQ** (RFC 9250): `tls.doq_listen`. DNS-over-QUIC with ALPN `doq`, each query
+  on its own bidirectional stream. Verified with an aioquic client.
 
 Certificates come from `tls.cert`/`tls.key` (PEM); a self-signed certificate is
-generated when they are omitted.
+generated when they are omitted. All three share the ring crypto provider.
+
+## DNS Cookies (RFC 7873)
+
+`[cookies] enabled` returns a keyed server cookie (SipHash over the client
+cookie, source IP, and a per-process secret) so returning clients are recognised
+and off-path spoofers are detected. `[cookies] require` enforces cookies on UDP:
+a cookieless query gets a BADCOOKIE challenge, mitigating amplification. Verified
+with `dig +cookie`.
+
+## Split-horizon views
+
+`[[view]]` serves a different zone set to matching client networks
+(`match_clients`), tried before the default `zone_dir`. Verified: internal
+clients see internal addresses and records that public clients never receive.
 
 ## Performance
 
@@ -152,13 +169,13 @@ crates/
   dns-zone      zone-file parsing/serialization, authoritative lookup, rrset editing
   dns-cache     TTL cache with negative caching (RFC 2308) and serve-stale (RFC 8767)
   dns-metrics   atomic counters
-  dns-guard     recursion ACL (CIDR) and per-client rate limiting
+  dns-guard     recursion ACL (CIDR), rate limiting, DNS cookies
   dns-tsig      TSIG HMAC-SHA256/512 (RFC 8945)
   dns-dnssec    DNSSEC signing and validation: DNSKEY/RRSIG/NSEC/NSEC3/DS
-  dns-tls       DoT/DoH TLS setup and DoH codec
+  dns-tls       DoT/DoH/DoQ TLS setup and DoH codec
   dns-xfr       AXFR/IXFR in and out, NOTIFY, journal, secondary refresh
   dns-resolver  resolution (zones → cache → upstream/recursive), singleflight, RPZ, DNSSEC validation
   rdns          binary: UDP/TCP/DoT/DoH listeners, management API, dynamic updates, config
 ```
 
-Tests: `cargo test` (74).
+Tests: `cargo test` (78).

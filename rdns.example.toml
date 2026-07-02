@@ -70,8 +70,19 @@ notify = []                    # secondaries to NOTIFY on zone change
 # self_signed_names = ["dns.example.lab"]
 # dot_listen = "0.0.0.0:853"
 # doh_listen = "0.0.0.0:443"       # HTTP/2 (ALPN h2) + HTTP/1.1
+# doq_listen = "0.0.0.0:853"       # DNS-over-QUIC (RFC 9250, ALPN doq)
 
 # --- Dynamic updates (RFC 2136 / nsupdate) ---
 [update]
 # allow = ["127.0.0.0/8"]        # client networks; empty = disabled
 # require_tsig = "xfrkey."        # require this TSIG key on updates
+
+# --- Split-horizon views (client-matched zone sets) ---
+# [[view]]
+# match_clients = ["10.0.0.0/8"]
+# zone_dir = "zones-internal"
+
+# --- DNS Cookies (RFC 7873) ---
+[cookies]
+enabled = true                   # return server cookies
+require = false                  # true = require valid cookie on UDP (BADCOOKIE)

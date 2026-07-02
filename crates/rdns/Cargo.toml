@@ -12,6 +12,8 @@ dns-metrics.workspace = true
 dns-resolver.workspace = true
 dns-xfr.workspace = true
 tokio-rustls.workspace = true
+quinn = { workspace = true }
+rustls = { workspace = true }
 bytes.workspace = true
 http.workspace = true
 h2.workspace = true

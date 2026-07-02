@@ -58,6 +58,11 @@ pub struct ServerCtx {
     pub require_tsig: Option<DnsName>,
     /// Everything needed to accept and commit RFC 2136 dynamic updates.
     pub updates: Option<UpdateCtx>,
+    /// DNS Cookie secret (RFC 7873); None disables cookies.
+    pub cookie_key: Option<dns_guard::cookie::CookieKey>,
+    /// Require a valid cookie on UDP (anti-amplification): cookieless queries
+    /// get a BADCOOKIE challenge instead of a full answer.
+    pub require_cookie: bool,
 }
 
 /// Configuration for dynamic updates (RFC 2136), shared with zone persistence.
@@ -140,8 +145,15 @@ pub async fn run_udp_worker(socket: UdpSocket, ctx: Arc<ServerCtx>) -> std::io::
             continue;
         }
 
+        // RFC 7873 cookie enforcement (UDP anti-amplification): answer a
+        // cookieless/invalid-cookie query with a BADCOOKIE challenge only.
+        if let Some(resp) = cookie_challenge(&ctx, &query, peer.ip()) {
+            let _ = socket.send_to(&resp.encode(), peer).await;
+            continue;
+        }
+
         let allowed = ctx.acl.is_allowed(peer.ip());
-        match ctx.resolver.resolve_local(&query, allowed) {
+        match ctx.resolver.resolve_local(&query, allowed, peer.ip()) {
             // Fast path: answered from zones/cache, sent inline.
             Outcome::Done(resp) => {
                 finish_udp(&ctx, &socket, peer, &query, resp, started).await;
@@ -155,6 +167,49 @@ pub async fn run_udp_worker(socket: UdpSocket, ctx: Arc<ServerCtx>) -> std::io::
                     finish_udp(&ctx, &socket, peer, &query, resp, started).await;
                 });
             }
+        }
+    }
+}
+
+/// Attach a fresh server cookie to a response echoing the client's cookie
+/// (RFC 7873). No-op when cookies are disabled or the client sent none.
+fn attach_cookie(ctx: &ServerCtx, resp: &mut Message, query: &Message, ip: std::net::IpAddr) {
+    use dns_proto::message::EDNS_COOKIE;
+    let (Some(key), Some(qedns)) = (&ctx.cookie_key, &query.edns) else { return };
+    let Some(client) = qedns.get_option(EDNS_COOKIE).and_then(cookie_client) else { return };
+    let opt = key.build(&client, ip, unix_now() as u32);
+    let edns = resp.edns.get_or_insert_with(dns_proto::message::Edns::ours);
+    edns.set_option(EDNS_COOKIE, &opt);
+}
+
+fn cookie_client(cookie: &[u8]) -> Option<[u8; 8]> {
+    dns_guard::cookie::CookieKey::client_cookie(cookie)
+}
+
+/// If cookie enforcement is on and a UDP query lacks a valid cookie, build a
+/// BADCOOKIE challenge (RFC 7873 §5.2.3): the client must retry with the
+/// returned server cookie. Returns None when the query may be answered.
+fn cookie_challenge(ctx: &ServerCtx, query: &Message, ip: std::net::IpAddr) -> Option<Message> {
+    use dns_guard::cookie::CookieStatus;
+    use dns_proto::message::EDNS_COOKIE;
+    if !ctx.require_cookie {
+        return None;
+    }
+    let key = ctx.cookie_key.as_ref()?;
+    let cookie = query.edns.as_ref().and_then(|e| e.get_option(EDNS_COOKIE)).unwrap_or(&[]);
+    let now = unix_now() as u32;
+    match key.verify(cookie, ip, now) {
+        CookieStatus::Valid | CookieStatus::Stale => None,
+        _ => {
+            // Challenge: echo a server cookie with extended rcode BADCOOKIE (23).
+            let mut resp = Message::response_to(query);
+            resp.flags.rcode = 23 & 0x0F; // low nibble in the header
+            let edns = resp.edns.get_or_insert_with(dns_proto::message::Edns::ours);
+            edns.ext_rcode = 23 >> 4; // high bits in the OPT ttl
+            if let Some(client) = cookie_client(cookie) {
+                edns.set_option(EDNS_COOKIE, &key.build(&client, ip, now));
+            }
+            Some(resp)
         }
     }
 }
@@ -187,6 +242,7 @@ async fn finish_udp(
     started: Instant,
 ) {
     strip_dnssec_unless_do(&mut resp, query);
+    attach_cookie(ctx, &mut resp, query, peer.ip());
     // Without EDNS the classic 512-byte limit applies (RFC 1035); with it,
     // the client's advertised size, kept within reason.
     let limit = query
@@ -327,6 +383,63 @@ async fn handle_h2_request(
     Ok(())
 }
 
+/// DNS-over-QUIC (RFC 9250): each query is a bidirectional stream carrying a
+/// 2-byte length-prefixed DNS message; the response is written back framed.
+pub async fn run_doq(endpoint: quinn::Endpoint, ctx: Arc<ServerCtx>) -> std::io::Result<()> {
+    while let Some(incoming) = endpoint.accept().await {
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let conn = match incoming.await {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!("doq: connection failed: {e}");
+                    return;
+                }
+            };
+            let peer = conn.remote_address();
+            // Each accepted bidi stream is one query/response exchange.
+            loop {
+                match conn.accept_bi().await {
+                    Ok((send, recv)) => {
+                        let ctx = ctx.clone();
+                        tokio::spawn(async move {
+                            let _ = serve_doq_stream(send, recv, peer, ctx).await;
+                        });
+                    }
+                    Err(_) => break, // connection closed
+                }
+            }
+        });
+    }
+    Ok(())
+}
+
+async fn serve_doq_stream(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    peer: SocketAddr,
+    ctx: Arc<ServerCtx>,
+) -> std::io::Result<()> {
+    // RFC 9250 §4.2: the message is length-prefixed, and the client closes its
+    // send side after the query.
+    let data = match recv.read_to_end(65535).await {
+        Ok(d) if d.len() >= 2 => d,
+        _ => return Ok(()),
+    };
+    let len = u16::from_be_bytes([data[0], data[1]]) as usize;
+    let body = data.get(2..2 + len).unwrap_or(&data[2..]);
+
+    Metrics::inc(&ctx.metrics.queries_tcp);
+    let started = Instant::now();
+    let reply = handle_query_bytes(&ctx, body, peer, "doq", started).await;
+    let mut framed = Vec::with_capacity(reply.len() + 2);
+    framed.extend_from_slice(&(reply.len() as u16).to_be_bytes());
+    framed.extend_from_slice(&reply);
+    let _ = send.write_all(&framed).await;
+    let _ = send.finish();
+    Ok(())
+}
+
 async fn serve_doh_conn<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     peer: SocketAddr,
@@ -461,8 +574,9 @@ pub async fn handle_query_bytes(
     match Message::parse(data) {
         Ok(query) => {
             let allowed = ctx.acl.is_allowed(peer.ip());
-            let mut resp = ctx.resolver.handle(&query, allowed).await;
+            let mut resp = ctx.resolver.handle(&query, allowed, peer.ip()).await;
             strip_dnssec_unless_do(&mut resp, &query);
+            attach_cookie(ctx, &mut resp, &query, peer.ip());
             observe(ctx, proto, peer, &query, &resp, started);
             // DoT/DoH have no 512-byte limit; TCP framing carries the rest.
             resp.encode_limited(u16::MAX as usize)

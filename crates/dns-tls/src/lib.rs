@@ -10,6 +10,14 @@ use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 
+/// A rustls config builder pinned to the ring provider, so callers don't have
+/// to install a process-wide default crypto provider.
+fn config_builder() -> rustls::ConfigBuilder<ServerConfig, rustls::WantsVerifier> {
+    ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports the default protocol versions")
+}
+
 /// Build a TLS acceptor from PEM cert+key files, or generate a self-signed
 /// certificate for the given DNS names when no files are provided (dev/lab).
 /// `alpn` sets the advertised protocols (e.g. `[b"h2", b"http/1.1"]` for DoH;
@@ -24,7 +32,7 @@ pub fn acceptor(
         (Some(c), Some(k)) => load_pem(c, k)?,
         _ => generate_self_signed(self_signed_names)?,
     };
-    let mut config = ServerConfig::builder()
+    let mut config = config_builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| format!("tls config: {e}"))?;
@@ -62,6 +70,27 @@ fn generate_self_signed(
     let key_der = PrivateKeyDer::try_from(cert.signing_key.serialize_der())
         .map_err(|e| format!("key der: {e}"))?;
     Ok((vec![cert_der], key_der))
+}
+
+/// Build a QUIC (quinn) server config for DNS-over-QUIC (RFC 9250), advertising
+/// ALPN `doq`. Uses the same certificate handling as DoT/DoH.
+pub fn quic_server_config(
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+    self_signed_names: &[String],
+) -> Result<quinn::ServerConfig, String> {
+    let (certs, key) = match (cert_path, key_path) {
+        (Some(c), Some(k)) => load_pem(c, k)?,
+        _ => generate_self_signed(self_signed_names)?,
+    };
+    let mut tls = config_builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("tls config: {e}"))?;
+    tls.alpn_protocols = vec![b"doq".to_vec()];
+    let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+        .map_err(|e| format!("quic config: {e}"))?;
+    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic)))
 }
 
 /// A parsed DoH request: the DNS query wire bytes from either a

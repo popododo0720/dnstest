@@ -5,3 +5,5 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+siphasher = { workspace = true }
+ring = { workspace = true }

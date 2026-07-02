@@ -45,6 +45,9 @@ pub struct Resolver {
     rpz: RwLock<Arc<Rpz>>,
     /// DNSSEC-signed material by zone origin (empty when unsigned).
     signed: RwLock<Arc<HashMap<DnsName, Arc<SignedZone>>>>,
+    /// Split-horizon views: client-matched zone sets, most-specific first.
+    /// The default (unconditional) zone set is the last entry.
+    views: RwLock<Arc<Vec<(dns_guard::Acl, Arc<Vec<Zone>>)>>>,
     /// Validating-resolver engine (set when DNSSEC validation is enabled).
     validator: Option<Validator>,
     /// Iterative recursive resolver (set in recursive mode; no forwarder).
@@ -66,6 +69,8 @@ pub struct ResolverOptions {
     pub validate: bool,
     /// Recursive mode: resolve iteratively from the root instead of forwarding.
     pub recursive: bool,
+    /// Split-horizon views (client ACL → zone set), tried before `zones`.
+    pub views: Vec<(dns_guard::Acl, Vec<Zone>)>,
 }
 
 /// Result of the synchronous resolution attempt.
@@ -86,8 +91,14 @@ pub struct Pending {
 
 impl Resolver {
     pub fn new(opts: ResolverOptions, metrics: Arc<Metrics>) -> Self {
+        let views: Vec<(dns_guard::Acl, Arc<Vec<Zone>>)> = opts
+            .views
+            .into_iter()
+            .map(|(acl, zones)| (acl, Arc::new(zones)))
+            .collect();
         Resolver {
             zones: RwLock::new(Arc::new(opts.zones)),
+            views: RwLock::new(Arc::new(views)),
             pool: UpstreamPool::new(opts.upstreams),
             forwards: opts
                 .forwards
@@ -165,9 +176,21 @@ impl Resolver {
         *self.rpz.write().unwrap() = Arc::new(rpz);
     }
 
-    /// Current zone set (cheap snapshot for readers).
+    /// Current default zone set (cheap snapshot for readers).
     pub fn zones(&self) -> Arc<Vec<Zone>> {
         self.zones.read().unwrap().clone()
+    }
+
+    /// The zone set a client should see (split-horizon): the first matching
+    /// view, or the default zones when no view matches.
+    fn zones_for(&self, client: std::net::IpAddr) -> Arc<Vec<Zone>> {
+        let views = self.views.read().unwrap().clone();
+        for (acl, zones) in views.iter() {
+            if acl.is_allowed(client) {
+                return zones.clone();
+            }
+        }
+        self.zones()
     }
 
     /// Atomically replace the zone set (API edits, SIGHUP reload).
@@ -185,15 +208,26 @@ impl Resolver {
 
     /// Full resolution; convenience for transports that do not use the
     /// sync/async split.
-    pub async fn handle(&self, query: &Message, recursion_allowed: bool) -> Message {
-        match self.resolve_local(query, recursion_allowed) {
+    pub async fn handle(
+        &self,
+        query: &Message,
+        recursion_allowed: bool,
+        client: std::net::IpAddr,
+    ) -> Message {
+        match self.resolve_local(query, recursion_allowed, client) {
             Outcome::Done(m) => m,
             Outcome::Pending(p) => self.resolve_pending(p).await,
         }
     }
 
-    /// Synchronous fast path: validation, authoritative zones, and cache.
-    pub fn resolve_local(&self, query: &Message, recursion_allowed: bool) -> Outcome {
+    /// Synchronous fast path: validation, authoritative zones (per the client's
+    /// view), and cache.
+    pub fn resolve_local(
+        &self,
+        query: &Message,
+        recursion_allowed: bool,
+        client: std::net::IpAddr,
+    ) -> Outcome {
         let mut resp = Message::response_to(query);
 
         // RFC 6891: unknown EDNS version gets BADVERS (extended rcode 16 =
@@ -232,8 +266,8 @@ impl Resolver {
             (self.pool.is_some() || self.recursor.is_some() || !self.forwards.is_empty())
                 && recursion_allowed;
 
-        // Authoritative data wins over forwarding.
-        let zones = self.zones();
+        // Authoritative data wins over forwarding (per the client's view).
+        let zones = self.zones_for(client);
         if let Some(zone) = find_zone(&zones, &q.qname) {
             resp.flags.aa = true;
             // DNSSEC is engaged only when the client set the DO bit (RFC 6840).
@@ -544,6 +578,8 @@ ns1  IN A   10.0.0.1
 www  IN A   10.0.0.10
 ";
 
+    const LOCAL: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+
     fn resolver(upstreams: Vec<SocketAddr>) -> Resolver {
         Resolver::new(
             ResolverOptions {
@@ -569,7 +605,7 @@ www  IN A   10.0.0.10
     #[tokio::test]
     async fn authoritative_answer_is_synchronous() {
         let r = resolver(vec![]);
-        let Outcome::Done(resp) = r.resolve_local(&query("www.example.lab", TYPE_A), true) else {
+        let Outcome::Done(resp) = r.resolve_local(&query("www.example.lab", TYPE_A), true, LOCAL) else {
             panic!("zone answers must not need upstream")
         };
         assert_eq!(resp.flags.rcode, RCODE_NOERROR);
@@ -581,7 +617,7 @@ www  IN A   10.0.0.10
     #[tokio::test]
     async fn nxdomain_carries_soa() {
         let r = resolver(vec![]);
-        let resp = r.handle(&query("missing.example.lab", TYPE_A), true).await;
+        let resp = r.handle(&query("missing.example.lab", TYPE_A), true, LOCAL).await;
         assert_eq!(resp.flags.rcode, RCODE_NXDOMAIN);
         assert_eq!(resp.authorities.len(), 1);
         assert_eq!(resp.authorities[0].rtype(), TYPE_SOA);
@@ -590,18 +626,18 @@ www  IN A   10.0.0.10
     #[tokio::test]
     async fn refuses_outside_zone_without_upstream() {
         let r = resolver(vec![]);
-        let resp = r.handle(&query("google.com", TYPE_A), true).await;
+        let resp = r.handle(&query("google.com", TYPE_A), true, LOCAL).await;
         assert_eq!(resp.flags.rcode, RCODE_REFUSED);
     }
 
     #[tokio::test]
     async fn acl_denied_recursion_is_refused_but_zones_still_answer() {
         let r = resolver(vec!["192.0.2.1:53".parse().unwrap()]);
-        let refused = r.handle(&query("google.com", TYPE_A), false).await;
+        let refused = r.handle(&query("google.com", TYPE_A), false, LOCAL).await;
         assert_eq!(refused.flags.rcode, RCODE_REFUSED);
         assert!(!refused.flags.ra);
 
-        let zoned = r.handle(&query("www.example.lab", TYPE_A), false).await;
+        let zoned = r.handle(&query("www.example.lab", TYPE_A), false, LOCAL).await;
         assert_eq!(zoned.flags.rcode, RCODE_NOERROR);
         assert_eq!(zoned.answers.len(), 1);
     }
@@ -616,7 +652,7 @@ $TTL 300
 www  IN A   10.9.9.9
 ";
         r.set_zones(vec![parse_zone_file(updated).unwrap()]);
-        let resp = r.handle(&query("www.example.lab", TYPE_A), true).await;
+        let resp = r.handle(&query("www.example.lab", TYPE_A), true, LOCAL).await;
         assert_eq!(resp.answers.len(), 1);
         assert_eq!(resp.answers[0].rdata.text(), "10.9.9.9");
     }

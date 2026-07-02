@@ -6,6 +6,7 @@ edition.workspace = true
 
 [dependencies]
 tokio-rustls.workspace = true
+quinn = { workspace = true }
 rustls.workspace = true
 rcgen.workspace = true
 rustls-pemfile.workspace = true

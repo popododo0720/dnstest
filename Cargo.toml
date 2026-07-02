@@ -40,11 +40,13 @@ socket2 = { version = "0.5", features = ["all"] }
 ring = "0.17"
 rsa = "0.9"
 rand = "0.8"
-rustls = "0.23"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = "0.26"
 rcgen = "0.14"
 base64 = "0.22"
+siphasher = "1"
 rustls-pemfile = "2"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 h2 = "0.4"
 http = "1"
 bytes = "1"

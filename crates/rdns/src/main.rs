@@ -175,6 +175,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // Pin rustls to the ring crypto provider (shared by DoT/DoH/DoQ).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let args = Args::parse();
     let mut cfg = config::load(args.config.as_deref())?;
     if let Some(listen) = args.listen {
@@ -206,6 +209,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         forwards.push((zone, f.upstreams.clone()));
     }
     let rpz = load_rpz(&cfg)?;
+
+    // Split-horizon views: each is a client ACL plus its own zone set.
+    let mut views: Vec<(Acl, Vec<Zone>)> = Vec::new();
+    for v in &cfg.views {
+        let acl = Acl::parse(&v.match_clients)?;
+        let vzones = load_zones(&v.zones, v.zone_dir.as_deref())?;
+        info!("view for {:?}: {} zone(s)", v.match_clients, vzones.len());
+        views.push((acl, vzones));
+    }
+
     let keyring = build_keyring(&cfg)?;
     let journal = Arc::new(match &cfg.journal_dir {
         Some(dir) => {
@@ -226,6 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             signed: Default::default(),
             validate: cfg.recursion.validate,
             recursive,
+            views,
         },
         metrics.clone(),
     ));
@@ -339,6 +353,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tsig_keys: keyring,
         require_tsig,
         updates,
+        cookie_key: cfg.cookies.enabled.then(dns_guard::cookie::CookieKey::random),
+        require_cookie: cfg.cookies.enabled && cfg.cookies.require,
     });
 
     let workers = if cfg.workers == 0 {
@@ -393,6 +409,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
             info!("DNS-over-HTTPS (h2 + http/1.1) on https://{addr}/dns-query");
+        }
+        if let Some(addr) = tls_cfg.doq_listen {
+            let qcfg = dns_tls::quic_server_config(cert, key, names)?;
+            let endpoint = quinn::Endpoint::server(qcfg, addr)
+                .map_err(|e| format!("doq bind {addr}: {e}"))?;
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = server::run_doq(endpoint, ctx).await {
+                    error!("doq listener died: {e}");
+                }
+            });
+            info!("DNS-over-QUIC on quic://{addr} (alpn doq)");
         }
     }
 

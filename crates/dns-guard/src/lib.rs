@@ -1,4 +1,7 @@
-//! Access control (CIDR allowlists) and per-client token-bucket rate limiting.
+//! Access control (CIDR allowlists), per-client token-bucket rate limiting,
+//! and DNS Cookies (anti-spoofing).
+
+pub mod cookie;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
