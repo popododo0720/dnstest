@@ -1,0 +1,13 @@
+[package]
+name = "dns-xfr"
+description = "Zone transfers: AXFR in/out, NOTIFY, secondary zone refresh"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dns-proto.workspace = true
+dns-zone.workspace = true
+dns-metrics.workspace = true
+dns-resolver.workspace = true
+tokio.workspace = true
+tracing.workspace = true

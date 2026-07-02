@@ -10,10 +10,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use std::collections::HashMap;
+
 use dns_guard::{Acl, RateLimiter};
 use dns_metrics::Metrics;
-use dns_proto::message::{Flags, Message, RCODE_FORMERR, rcode_name, type_name};
+use dns_proto::message::{
+    Flags, Message, OPCODE_NOTIFY, RCODE_FORMERR, RCODE_NOTIMP, RCODE_REFUSED, TYPE_AXFR,
+    rcode_name, type_name,
+};
+use dns_proto::name::DnsName;
 use dns_resolver::{Outcome, Resolver};
+use dns_xfr::Secondary;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -29,6 +36,10 @@ pub struct ServerCtx {
     pub acl: Acl,
     pub limiter: Option<RateLimiter>,
     pub query_log: bool,
+    /// Networks allowed to AXFR our zones.
+    pub transfer_acl: Acl,
+    /// Secondary zones by origin, for routing incoming NOTIFYs.
+    pub secondaries: HashMap<DnsName, Arc<Secondary>>,
 }
 
 /// N kernel-load-balanced sockets bound to the same address.
@@ -72,6 +83,21 @@ pub async fn run_udp_worker(socket: UdpSocket, ctx: Arc<ServerCtx>) -> std::io::
                 continue;
             }
         };
+
+        // RFC 1996: a NOTIFY for one of our secondary zones kicks its
+        // refresh loop; everything else with that opcode is refused.
+        if query.flags.opcode == OPCODE_NOTIFY {
+            Metrics::inc(&ctx.metrics.notify_received);
+            let mut resp = Message::response_to(&query);
+            resp.flags.opcode = OPCODE_NOTIFY;
+            resp.flags.aa = true;
+            match query.questions.first().and_then(|q| ctx.secondaries.get(&q.qname)) {
+                Some(sec) => sec.kick.notify_one(),
+                None => resp.flags.rcode = RCODE_REFUSED,
+            }
+            let _ = socket.send_to(&resp.encode(), peer).await;
+            continue;
+        }
 
         let allowed = ctx.acl.is_allowed(peer.ip());
         match ctx.resolver.resolve_local(&query, allowed) {
@@ -155,6 +181,25 @@ async fn serve_tcp_conn(
 
         let started = Instant::now();
         let reply = match Message::parse(&data) {
+            Ok(query) if is_axfr(&query) => {
+                match axfr_out(&ctx, peer, &query) {
+                    Ok(frames) => {
+                        Metrics::inc(&ctx.metrics.axfr_out);
+                        info!("tcp {peer} AXFR {} -> {} message(s)",
+                            query.questions[0].qname, frames.len());
+                        for frame in frames {
+                            stream.write_all(&frame).await?;
+                        }
+                        continue;
+                    }
+                    Err(rcode) => {
+                        let mut resp = Message::response_to(&query);
+                        resp.flags.rcode = rcode;
+                        observe(&ctx, "tcp", peer, &query, &resp, started);
+                        resp.encode()
+                    }
+                }
+            }
             Ok(query) => {
                 let allowed = ctx.acl.is_allowed(peer.ip());
                 let resp = ctx.resolver.handle(&query, allowed).await;
@@ -174,6 +219,26 @@ async fn serve_tcp_conn(
         framed.extend_from_slice(&reply);
         stream.write_all(&framed).await?;
     }
+}
+
+fn is_axfr(query: &Message) -> bool {
+    query.flags.opcode == 0
+        && query.questions.len() == 1
+        && query.questions[0].qtype == TYPE_AXFR
+}
+
+/// Zone transfer, gated by the transfer ACL. Returns the framed messages or
+/// the refusal rcode.
+fn axfr_out(ctx: &ServerCtx, peer: SocketAddr, query: &Message) -> Result<Vec<Vec<u8>>, u8> {
+    if !ctx.transfer_acl.is_allowed(peer.ip()) {
+        return Err(RCODE_REFUSED);
+    }
+    let qname = &query.questions[0].qname;
+    let zones = ctx.resolver.zones();
+    let Some(zone) = zones.iter().find(|z| z.origin == *qname) else {
+        return Err(RCODE_NOTIMP);
+    };
+    Ok(dns_xfr::axfr_messages(zone, query))
 }
 
 /// Echo the id back with FORMERR if there is enough to salvage one.

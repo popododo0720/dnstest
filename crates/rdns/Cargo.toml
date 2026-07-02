@@ -10,6 +10,7 @@ dns-zone.workspace = true
 dns-guard.workspace = true
 dns-metrics.workspace = true
 dns-resolver.workspace = true
+dns-xfr.workspace = true
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true

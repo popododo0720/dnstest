@@ -23,6 +23,14 @@ pub struct Config {
     pub rate_limit: RateLimitCfg,
     /// Management REST API; absent = disabled.
     pub api: Option<ApiCfg>,
+    pub transfer: TransferCfg,
+    /// Zones mirrored from primaries via AXFR.
+    #[serde(rename = "secondary")]
+    pub secondaries: Vec<SecondaryCfg>,
+    /// Conditional forwarding: send matching queries to dedicated upstreams.
+    #[serde(rename = "forward")]
+    pub forwards: Vec<ForwardCfg>,
+    pub rpz: RpzCfg,
 }
 
 impl Default for Config {
@@ -37,8 +45,42 @@ impl Default for Config {
             cache: CacheCfg::default(),
             rate_limit: RateLimitCfg::default(),
             api: None,
+            transfer: TransferCfg::default(),
+            secondaries: Vec::new(),
+            forwards: Vec::new(),
+            rpz: RpzCfg::default(),
         }
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransferCfg {
+    /// Networks allowed to AXFR our zones; empty = transfers denied.
+    pub allow: Vec<String>,
+    /// Secondaries to NOTIFY when a zone changes.
+    pub notify: Vec<SocketAddr>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecondaryCfg {
+    pub zone: String,
+    pub primaries: Vec<SocketAddr>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardCfg {
+    pub zone: String,
+    pub upstreams: Vec<SocketAddr>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RpzCfg {
+    /// Blocklist file: `domain` (NXDOMAIN) or `domain address` (sinkhole).
+    pub file: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]

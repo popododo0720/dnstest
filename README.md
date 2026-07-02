@@ -29,7 +29,24 @@ curl -H "$K" -X DELETE $B/zones/new.lab.
 curl -H "$K" $B/statistics             # 서버 통계
 ```
 
-변경은 즉시 반영되고(SOA 시리얼 자동 증가) `zone_dir`에 존 파일로 영속화된다.
+변경은 즉시 반영되고(SOA 시리얼 자동 증가) `zone_dir`에 존 파일로 영속화되며,
+설정된 세컨더리들에게 NOTIFY가 나간다.
+
+## 존 전송 / 이중화
+
+- **프라이머리**: AXFR-out (`[transfer].allow` ACL) + 존 변경 시 NOTIFY 발송.
+  BIND9를 세컨더리로 붙여 상호운용 검증됨.
+- **세컨더리**: `[[secondary]]`로 선언하면 SOA 시리얼 폴링 + NOTIFY 수신으로
+  프라이머리에서 자동 AXFR (RFC 1982 시리얼 연산).
+- **조건부 포워딩**: `[[forward]]`로 특정 존만 지정 업스트림으로.
+
+## RPZ (도메인 차단/싱크홀)
+
+`[rpz].file`에 한 줄씩: `phishing.bad`(NXDOMAIN), `malware.bad 10.66.66.66`(싱크홀).
+서브도메인까지 커버, SIGHUP으로 리로드.
+
+그 외: serve-stale(RFC 8767, 업스트림 전체 장애 시 만료 캐시로 응답),
+`version.bind CH TXT` 호환.
 
 ## 성능
 
@@ -51,8 +68,11 @@ crates/
   dns-cache     TTL 캐시 + 네거티브 캐싱 (RFC 2308)
   dns-metrics   통계 카운터
   dns-guard     재귀 ACL(CIDR) + 클라이언트별 레이트리밋
-  dns-resolver  존 → 캐시 → 업스트림 해석, singleflight, 페일오버
+  dns-resolver  존 → 캐시 → 업스트림 해석, singleflight, 페일오버, RPZ
+  dns-xfr       AXFR 송수신, NOTIFY, 세컨더리 리프레시 루프
   rdns          바이너리: UDP/TCP 리스너, 관리 API, 설정
 ```
 
 테스트: `cargo test`
+
+미구현(알려진 한계): DNSSEC, IXFR(AXFR로 폴백), TSIG(전송은 IP ACL로 통제), DoT/DoH

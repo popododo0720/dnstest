@@ -29,7 +29,11 @@ impl fmt::Display for WireError {
 impl std::error::Error for WireError {}
 
 pub const CLASS_IN: u16 = 1;
+pub const CLASS_CH: u16 = 3;
 pub const CLASS_ANY: u16 = 255;
+
+pub const OPCODE_QUERY: u8 = 0;
+pub const OPCODE_NOTIFY: u8 = 4;
 
 pub const TYPE_A: u16 = 1;
 pub const TYPE_NS: u16 = 2;
@@ -41,6 +45,8 @@ pub const TYPE_TXT: u16 = 16;
 pub const TYPE_AAAA: u16 = 28;
 pub const TYPE_SRV: u16 = 33;
 pub const TYPE_OPT: u16 = 41;
+pub const TYPE_IXFR: u16 = 251;
+pub const TYPE_AXFR: u16 = 252;
 pub const TYPE_ANY: u16 = 255;
 
 pub fn type_name(t: u16) -> String {
@@ -55,6 +61,8 @@ pub fn type_name(t: u16) -> String {
         TYPE_AAAA => "AAAA".into(),
         TYPE_SRV => "SRV".into(),
         TYPE_OPT => "OPT".into(),
+        TYPE_IXFR => "IXFR".into(),
+        TYPE_AXFR => "AXFR".into(),
         TYPE_ANY => "ANY".into(),
         other => format!("TYPE{other}"),
     }

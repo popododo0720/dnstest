@@ -36,8 +36,24 @@ pub struct ApiCtx {
     pub metrics: Arc<Metrics>,
     pub key: String,
     pub zone_dir: Option<PathBuf>,
+    /// Secondaries to NOTIFY after a change.
+    pub notify_targets: Vec<std::net::SocketAddr>,
     /// Serializes writers; readers work on lock-free snapshots.
     pub write_lock: tokio::sync::Mutex<()>,
+}
+
+/// Tell configured secondaries the zone changed (fire-and-forget).
+fn notify_secondaries(ctx: &ApiCtx, origin: &DnsName) {
+    for &target in &ctx.notify_targets {
+        let origin = origin.clone();
+        let metrics = ctx.metrics.clone();
+        tokio::spawn(async move {
+            match dns_xfr::send_notify(target, &origin).await {
+                Ok(()) => Metrics::inc(&metrics.notify_sent),
+                Err(e) => warn!("notify {target} about {origin} failed: {e}"),
+            }
+        });
+    }
 }
 
 #[derive(Serialize)]
@@ -304,6 +320,7 @@ async fn create_zone(ctx: &ApiCtx, body: &[u8]) -> Reply {
     zones.push(zone.clone());
     ctx.resolver.set_zones(zones);
     persist(ctx, &zone);
+    notify_secondaries(ctx, &origin);
     info!("api: created zone {origin}");
     Reply::json("201 Created", serde_json::json!({"name": origin.to_string()}).to_string())
 }
@@ -335,6 +352,7 @@ async fn patch_zone(ctx: &ApiCtx, name: &str, body: &[u8]) -> Reply {
     zones[idx] = zone.clone();
     ctx.resolver.set_zones(zones);
     persist(ctx, &zone);
+    notify_secondaries(ctx, &origin);
     info!("api: patched zone {origin} ({} rrsets)", req.rrsets.len());
     Reply::ok(serde_json::json!({"name": origin.to_string(), "serial": zone_serial(&zone)}))
 }

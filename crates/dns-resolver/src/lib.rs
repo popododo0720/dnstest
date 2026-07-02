@@ -8,8 +8,10 @@
 //! asynchronous [`Resolver::resolve_pending`].
 
 mod flight;
+mod rpz;
 mod upstream;
 
+pub use rpz::{Rpz, RpzAction};
 pub use upstream::ForwardError;
 
 use std::net::SocketAddr;
@@ -18,8 +20,9 @@ use std::sync::{Arc, RwLock};
 use dns_cache::{Cache, Key};
 use dns_metrics::Metrics;
 use dns_proto::message::{
-    CLASS_ANY, CLASS_IN, Message, RCODE_FORMERR, RCODE_NOTIMP, RCODE_REFUSED, RCODE_SERVFAIL,
-    Record, TYPE_SOA,
+    CLASS_ANY, CLASS_CH, CLASS_IN, Message, RCODE_FORMERR, RCODE_NOTIMP, RCODE_NXDOMAIN,
+    RCODE_REFUSED, RCODE_SERVFAIL, RData, Record, TYPE_A, TYPE_AAAA, TYPE_ANY, TYPE_AXFR,
+    TYPE_IXFR, TYPE_SOA, TYPE_TXT,
 };
 use dns_proto::name::DnsName;
 use dns_zone::Zone;
@@ -31,9 +34,21 @@ use crate::upstream::UpstreamPool;
 pub struct Resolver {
     zones: RwLock<Arc<Vec<Zone>>>,
     pool: Option<UpstreamPool>,
+    /// Conditional forwarding: (zone, upstreams), longest suffix wins.
+    forwards: Vec<(DnsName, UpstreamPool)>,
+    rpz: RwLock<Arc<Rpz>>,
     cache: Cache,
     flight: Singleflight,
     metrics: Arc<Metrics>,
+}
+
+#[derive(Default)]
+pub struct ResolverOptions {
+    pub zones: Vec<Zone>,
+    pub upstreams: Vec<SocketAddr>,
+    pub forwards: Vec<(DnsName, Vec<SocketAddr>)>,
+    pub cache_size: usize,
+    pub rpz: Rpz,
 }
 
 /// Result of the synchronous resolution attempt.
@@ -53,19 +68,45 @@ pub struct Pending {
 }
 
 impl Resolver {
-    pub fn new(
-        zones: Vec<Zone>,
-        upstreams: Vec<SocketAddr>,
-        cache_size: usize,
-        metrics: Arc<Metrics>,
-    ) -> Self {
+    pub fn new(opts: ResolverOptions, metrics: Arc<Metrics>) -> Self {
         Resolver {
-            zones: RwLock::new(Arc::new(zones)),
-            pool: UpstreamPool::new(upstreams),
-            cache: Cache::new(cache_size),
+            zones: RwLock::new(Arc::new(opts.zones)),
+            pool: UpstreamPool::new(opts.upstreams),
+            forwards: opts
+                .forwards
+                .into_iter()
+                .filter_map(|(zone, ups)| UpstreamPool::new(ups).map(|p| (zone, p)))
+                .collect(),
+            rpz: RwLock::new(Arc::new(opts.rpz)),
+            cache: Cache::new(opts.cache_size.max(1)),
             flight: Singleflight::default(),
             metrics,
         }
+    }
+
+    /// The upstream pool responsible for `name`: the most specific forward
+    /// zone, falling back to the default resolvers.
+    fn pool_for(&self, name: &DnsName) -> Option<&UpstreamPool> {
+        self.forwards
+            .iter()
+            .filter(|(zone, _)| name.ends_with(zone))
+            .max_by_key(|(zone, _)| zone.label_count())
+            .map(|(_, pool)| pool)
+            .or(self.pool.as_ref())
+    }
+
+    /// Replace or add a single zone (secondary transfers).
+    pub fn upsert_zone(&self, zone: Zone) {
+        let mut zones = self.zones().as_ref().clone();
+        match zones.iter().position(|z| z.origin == zone.origin) {
+            Some(i) => zones[i] = zone,
+            None => zones.push(zone),
+        }
+        self.set_zones(zones);
+    }
+
+    pub fn set_rpz(&self, rpz: Rpz) {
+        *self.rpz.write().unwrap() = Arc::new(rpz);
     }
 
     /// Current zone set (cheap snapshot for readers).
@@ -118,11 +159,21 @@ impl Resolver {
             return Outcome::Done(resp);
         }
         let q = &query.questions[0];
+        // CHAOS class: answer version.bind like BIND does, refuse the rest.
+        if q.qclass == CLASS_CH {
+            return Outcome::Done(chaos_answer(resp, q));
+        }
         if q.qclass != CLASS_IN && q.qclass != CLASS_ANY {
             resp.flags.rcode = RCODE_NOTIMP;
             return Outcome::Done(resp);
         }
-        resp.flags.ra = self.pool.is_some() && recursion_allowed;
+        // Zone transfers are TCP-only and handled at the transport layer.
+        if q.qtype == TYPE_AXFR || q.qtype == TYPE_IXFR {
+            resp.flags.rcode = RCODE_NOTIMP;
+            return Outcome::Done(resp);
+        }
+        resp.flags.ra =
+            (self.pool.is_some() || !self.forwards.is_empty()) && recursion_allowed;
 
         // Authoritative data wins over forwarding.
         let zones = self.zones();
@@ -137,7 +188,7 @@ impl Resolver {
             // A CNAME chain that leaves the zone: keep resolving if the
             // client asked for recursion and is allowed to use it.
             if let Some(target) = result.offsite {
-                if query.flags.rd && self.pool.is_some() && recursion_allowed {
+                if query.flags.rd && self.pool_for(&target).is_some() && recursion_allowed {
                     let key = Key { qname: target.clone(), qtype: q.qtype };
                     if let Some(hit) = self.cache_get(&key) {
                         merge(&mut resp, hit, true);
@@ -155,7 +206,32 @@ impl Resolver {
             return Outcome::Done(resp);
         }
 
-        if !query.flags.rd || self.pool.is_none() {
+        // Response policy: applies to anything we would resolve for clients.
+        let rpz = self.rpz.read().unwrap().clone();
+        if let Some(action) = rpz.lookup(&q.qname) {
+            Metrics::inc(&self.metrics.rpz_blocked);
+            match action {
+                RpzAction::Block => resp.flags.rcode = RCODE_NXDOMAIN,
+                RpzAction::Redirect(ip) => {
+                    let rdata = match (ip, q.qtype) {
+                        (std::net::IpAddr::V4(v4), TYPE_A | TYPE_ANY) => Some(RData::A(v4)),
+                        (std::net::IpAddr::V6(v6), TYPE_AAAA | TYPE_ANY) => Some(RData::Aaaa(v6)),
+                        _ => None, // sinkhole family does not match qtype: NODATA
+                    };
+                    if let Some(rdata) = rdata {
+                        resp.answers.push(Record {
+                            name: q.qname.clone(),
+                            class: CLASS_IN,
+                            ttl: 60,
+                            rdata,
+                        });
+                    }
+                }
+            }
+            return Outcome::Done(resp);
+        }
+
+        if !query.flags.rd || self.pool_for(&q.qname).is_none() {
             resp.flags.rcode = RCODE_REFUSED;
             return Outcome::Done(resp);
         }
@@ -177,8 +253,17 @@ impl Resolver {
         match self.resolve_external(&p.target, p.qtype).await {
             Ok(hit) => merge(&mut p.resp, hit, p.append),
             Err(e) => {
-                warn!("upstream lookup {} type{} failed: {e}", p.target, p.qtype);
-                p.resp.flags.rcode = RCODE_SERVFAIL;
+                // All upstreams down: serve stale cache data if we have any
+                // (RFC 8767) before giving up with SERVFAIL.
+                let key = Key { qname: p.target.clone(), qtype: p.qtype };
+                if let Some(hit) = self.cache.get_stale(&key) {
+                    Metrics::inc(&self.metrics.served_stale);
+                    warn!("upstreams failed for {}, serving stale data", p.target);
+                    merge(&mut p.resp, hit, p.append);
+                } else {
+                    warn!("upstream lookup {} type{} failed: {e}", p.target, p.qtype);
+                    p.resp.flags.rcode = RCODE_SERVFAIL;
+                }
             }
         }
         p.resp
@@ -206,7 +291,7 @@ impl Resolver {
             match self.flight.begin(&key) {
                 Role::Leader(_guard) => {
                     Metrics::inc(&self.metrics.cache_misses);
-                    let pool = self.pool.as_ref().ok_or(ForwardError::NoUpstream)?;
+                    let pool = self.pool_for(qname).ok_or(ForwardError::NoUpstream)?;
                     let msg = pool.query(qname, qtype, &self.metrics).await?;
                     // Keep only the SOA from the authority section — it is
                     // what negative answers need; referral NS sets are noise.
@@ -233,10 +318,30 @@ impl Resolver {
             }
         }
         // Leaders kept failing with uncacheable results; go direct.
-        let pool = self.pool.as_ref().ok_or(ForwardError::NoUpstream)?;
+        let pool = self.pool_for(qname).ok_or(ForwardError::NoUpstream)?;
         let msg = pool.query(qname, qtype, &self.metrics).await?;
         Ok((msg.flags.rcode, msg.answers, Vec::new()))
     }
+}
+
+/// `version.bind CH TXT` compatibility; everything else in CHAOS is refused.
+fn chaos_answer(mut resp: Message, q: &dns_proto::message::Question) -> Message {
+    let is_version = ["version.bind", "version.server"]
+        .iter()
+        .any(|n| DnsName::parse_str(n).is_ok_and(|n| n == q.qname));
+    if is_version && (q.qtype == TYPE_TXT || q.qtype == TYPE_ANY) {
+        resp.answers.push(Record {
+            name: q.qname.clone(),
+            class: CLASS_CH,
+            ttl: 0,
+            rdata: RData::Txt(vec![
+                format!("rdns {}", env!("CARGO_PKG_VERSION")).into_bytes(),
+            ]),
+        });
+    } else {
+        resp.flags.rcode = RCODE_REFUSED;
+    }
+    resp
 }
 
 fn find_zone<'a>(zones: &'a [Zone], name: &DnsName) -> Option<&'a Zone> {
@@ -280,9 +385,12 @@ www  IN A   10.0.0.10
 
     fn resolver(upstreams: Vec<SocketAddr>) -> Resolver {
         Resolver::new(
-            vec![parse_zone_file(ZONE).unwrap()],
-            upstreams,
-            16,
+            ResolverOptions {
+                zones: vec![parse_zone_file(ZONE).unwrap()],
+                upstreams,
+                cache_size: 16,
+                ..ResolverOptions::default()
+            },
             Arc::new(Metrics::new()),
         )
     }

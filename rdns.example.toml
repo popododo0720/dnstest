@@ -21,3 +21,20 @@ burst = 0
 [api]
 listen = "127.0.0.1:8081"
 key = "changeme"       # X-API-Key header
+
+[transfer]
+allow = ["127.0.0.0/8"]        # networks allowed to AXFR our zones
+notify = []                    # secondaries to NOTIFY on zone change
+
+# Mirror a zone from a primary (AXFR + SOA refresh + NOTIFY):
+# [[secondary]]
+# zone = "example.org."
+# primaries = ["10.0.0.1:53"]
+
+# Conditional forwarding:
+# [[forward]]
+# zone = "corp.internal."
+# upstreams = ["10.1.1.1:53"]
+
+[rpz]
+# file = "rpz.txt"             # `domain` = NXDOMAIN, `domain addr` = sinkhole

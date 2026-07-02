@@ -10,6 +10,10 @@ use dns_proto::name::DnsName;
 const MAX_POSITIVE_TTL: u32 = 86_400;
 const MAX_NEGATIVE_TTL: u32 = 3_600;
 const DEFAULT_NEGATIVE_TTL: u32 = 60;
+/// How long past expiry an entry may still be served stale (RFC 8767 §5).
+const STALE_WINDOW: Duration = Duration::from_secs(24 * 3600);
+/// TTL stamped onto stale answers (RFC 8767 recommends <= 30s).
+const STALE_TTL: u32 = 30;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Key {
@@ -56,11 +60,35 @@ impl Cache {
                         e.authorities.iter().map(adjust).collect(),
                     ));
                 }
-                Some(_) => {} // expired: fall through and remove
+                // Expired entries are kept for the serve-stale window and
+                // only evicted once past it.
+                Some(e) if now > e.expires + STALE_WINDOW => {}
+                Some(_) => return None,
             }
         }
         self.inner.write().unwrap().remove(key);
         None
+    }
+
+    /// Serve-stale (RFC 8767): an expired entry within the stale window,
+    /// answers re-labeled with a short TTL. Only for upstream outages.
+    pub fn get_stale(&self, key: &Key) -> Option<(u8, Vec<Record>, Vec<Record>)> {
+        let now = Instant::now();
+        let map = self.inner.read().unwrap();
+        let e = map.get(key)?;
+        if now <= e.expires || now > e.expires + STALE_WINDOW {
+            return None;
+        }
+        let adjust = |r: &Record| {
+            let mut r = r.clone();
+            r.ttl = STALE_TTL;
+            r
+        };
+        Some((
+            e.rcode,
+            e.answers.iter().map(adjust).collect(),
+            e.authorities.iter().map(adjust).collect(),
+        ))
     }
 
     /// Store a response. Only cacheable outcomes (NOERROR/NXDOMAIN) are kept;
@@ -93,7 +121,7 @@ impl Cache {
 
         let mut map = self.inner.write().unwrap();
         if map.len() >= self.max_entries && !map.contains_key(&key) {
-            map.retain(|_, e| e.expires > now);
+            map.retain(|_, e| now <= e.expires + STALE_WINDOW);
             if map.len() >= self.max_entries {
                 // Still full of live entries: shed an arbitrary ~10%. Simple
                 // and O(n), but only runs when the cache is genuinely full.

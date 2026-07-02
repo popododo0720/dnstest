@@ -269,6 +269,16 @@ impl Zone {
         }
     }
 
+    /// Every record with the SOA first — the AXFR payload order.
+    pub fn all_records(&self) -> Vec<Record> {
+        let mut out = Vec::with_capacity(self.record_count);
+        out.push(self.soa.clone());
+        for rrs in self.records.values() {
+            out.extend(rrs.iter().filter(|r| r.rtype() != TYPE_SOA).cloned());
+        }
+        out
+    }
+
     fn recount(&mut self) {
         self.record_count = self.records.values().map(Vec::len).sum();
     }

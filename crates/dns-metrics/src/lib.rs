@@ -42,6 +42,12 @@ pub struct Metrics {
     pub rate_limited: AtomicU64,
     pub recursion_refused: AtomicU64,
     pub zone_reloads: AtomicU64,
+    pub axfr_out: AtomicU64,
+    pub axfr_in: AtomicU64,
+    pub notify_sent: AtomicU64,
+    pub notify_received: AtomicU64,
+    pub rpz_blocked: AtomicU64,
+    pub served_stale: AtomicU64,
     latency: Histogram,
 }
 
@@ -67,6 +73,12 @@ impl Metrics {
             rate_limited: AtomicU64::new(0),
             recursion_refused: AtomicU64::new(0),
             zone_reloads: AtomicU64::new(0),
+            axfr_out: AtomicU64::new(0),
+            axfr_in: AtomicU64::new(0),
+            notify_sent: AtomicU64::new(0),
+            notify_received: AtomicU64::new(0),
+            rpz_blocked: AtomicU64::new(0),
+            served_stale: AtomicU64::new(0),
             latency: Histogram::default(),
         }
     }
@@ -98,6 +110,12 @@ impl Metrics {
             ("rate-limited-drops".into(), self.rate_limited.load(Relaxed)),
             ("recursion-refused".into(), self.recursion_refused.load(Relaxed)),
             ("zone-reloads".into(), self.zone_reloads.load(Relaxed)),
+            ("axfr-out".into(), self.axfr_out.load(Relaxed)),
+            ("axfr-in".into(), self.axfr_in.load(Relaxed)),
+            ("notify-sent".into(), self.notify_sent.load(Relaxed)),
+            ("notify-received".into(), self.notify_received.load(Relaxed)),
+            ("rpz-blocked".into(), self.rpz_blocked.load(Relaxed)),
+            ("served-stale".into(), self.served_stale.load(Relaxed)),
         ];
         for (rc, c) in self.rcodes.iter().enumerate() {
             let v = c.load(Relaxed);

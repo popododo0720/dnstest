@@ -7,6 +7,7 @@ members = [
     "crates/dns-metrics",
     "crates/dns-guard",
     "crates/dns-resolver",
+    "crates/dns-xfr",
     "crates/rdns",
 ]
 
@@ -21,6 +22,7 @@ dns-cache = { path = "crates/dns-cache" }
 dns-metrics = { path = "crates/dns-metrics" }
 dns-guard = { path = "crates/dns-guard" }
 dns-resolver = { path = "crates/dns-resolver" }
+dns-xfr = { path = "crates/dns-xfr" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "signal", "sync"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"

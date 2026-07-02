@@ -8,10 +8,14 @@ mod server;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use clap::Parser;
 use dns_guard::{Acl, RateLimiter};
 use dns_metrics::Metrics;
-use dns_resolver::Resolver;
+use dns_proto::name::DnsName;
+use dns_resolver::{Resolver, ResolverOptions, Rpz};
+use dns_xfr::Secondary;
 use dns_zone::Zone;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -65,6 +69,17 @@ fn load_zones(explicit: &[PathBuf], zone_dir: Option<&Path>) -> Result<Vec<Zone>
     Ok(zones)
 }
 
+fn load_rpz(cfg: &config::Config) -> Result<Rpz, String> {
+    let Some(path) = &cfg.rpz.file else {
+        return Ok(Rpz::default());
+    };
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let rpz = Rpz::parse(&text)?;
+    info!("loaded {} rpz rule(s) from {}", rpz.len(), path.display());
+    Ok(rpz)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -87,21 +102,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let zones = load_zones(&cfg.zones, cfg.zone_dir.as_deref())?;
     let upstreams = if cfg.recursion.enabled { cfg.recursion.upstreams.clone() } else { vec![] };
     let acl = Acl::parse(&cfg.recursion.allow)?;
+    let transfer_acl = Acl::parse(&cfg.transfer.allow)?;
     let limiter = (cfg.rate_limit.qps > 0)
         .then(|| RateLimiter::new(cfg.rate_limit.qps, cfg.rate_limit.burst));
 
+    let mut forwards = Vec::new();
+    for f in &cfg.forwards {
+        let zone = DnsName::parse_str(&f.zone).map_err(|e| format!("forward zone: {e}"))?;
+        info!("forward zone {zone} -> {:?}", f.upstreams);
+        forwards.push((zone, f.upstreams.clone()));
+    }
+    let rpz = load_rpz(&cfg)?;
+
     let resolver = Arc::new(Resolver::new(
-        zones,
-        upstreams.clone(),
-        cfg.cache.max_entries,
+        ResolverOptions {
+            zones,
+            upstreams: upstreams.clone(),
+            forwards,
+            cache_size: cfg.cache.max_entries,
+            rpz,
+        },
         metrics.clone(),
     ));
+
+    // Secondary zones: one refresh task per zone, kickable via NOTIFY.
+    let mut secondaries: HashMap<DnsName, Arc<Secondary>> = HashMap::new();
+    for sc in &cfg.secondaries {
+        let origin = DnsName::parse_str(&sc.zone).map_err(|e| format!("secondary zone: {e}"))?;
+        let sec = Arc::new(Secondary {
+            origin: origin.clone(),
+            primaries: sc.primaries.clone(),
+            kick: tokio::sync::Notify::new(),
+        });
+        info!("secondary zone {origin} from {:?}", sc.primaries);
+        secondaries.insert(origin, sec.clone());
+        tokio::spawn(dns_xfr::run_secondary(sec, resolver.clone(), metrics.clone()));
+    }
+
     let ctx = Arc::new(server::ServerCtx {
         resolver: resolver.clone(),
         metrics: metrics.clone(),
         acl,
         limiter,
         query_log: cfg.query_log,
+        transfer_acl,
+        secondaries,
     });
 
     let workers = if cfg.workers == 0 {
@@ -134,6 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             metrics: metrics.clone(),
             key: api_cfg.key.clone(),
             zone_dir: cfg.zone_dir.clone(),
+            notify_targets: cfg.transfer.notify.clone(),
             write_lock: tokio::sync::Mutex::new(()),
         });
         tokio::spawn(async move {
@@ -167,6 +213,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         info!("zones reloaded");
                     }
                     Err(e) => warn!("zone reload failed, keeping current zones: {e}"),
+                }
+                match load_rpz(&cfg) {
+                    Ok(rpz) => resolver.set_rpz(rpz),
+                    Err(e) => warn!("rpz reload failed, keeping current rules: {e}"),
                 }
             }
             _ = term.recv() => break,

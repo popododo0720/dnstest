@@ -43,6 +43,10 @@ impl DnsName {
         DnsName { labels: Vec::new() }
     }
 
+    pub fn labels(&self) -> &[Vec<u8>] {
+        &self.labels
+    }
+
     pub fn label_count(&self) -> usize {
         self.labels.len()
     }

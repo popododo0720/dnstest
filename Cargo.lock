@@ -151,6 +151,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dns-xfr"
+version = "0.1.0"
+dependencies = [
+ "dns-metrics",
+ "dns-proto",
+ "dns-resolver",
+ "dns-zone",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dns-zone"
 version = "0.1.0"
 dependencies = [
@@ -305,6 +317,7 @@ dependencies = [
  "dns-metrics",
  "dns-proto",
  "dns-resolver",
+ "dns-xfr",
  "dns-zone",
  "serde",
  "serde_json",
