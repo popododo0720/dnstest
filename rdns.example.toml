@@ -13,6 +13,7 @@ mode = "forward"       # "forward" (use upstreams) or "recursive" (iterate from 
 upstreams = ["1.1.1.1:53", "8.8.8.8:53"]   # failover order (forward mode)
 allow = ["127.0.0.0/8", "10.0.0.0/8", "192.168.0.0/16", "::1/128"]
 validate = false       # true = DNSSEC-validate answers against the root anchor
+# trust_anchor_file = "root.anchors"   # DS presentation lines; default = built-in root KSK
 
 [cache]
 max_entries = 100000

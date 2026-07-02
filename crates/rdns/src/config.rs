@@ -239,6 +239,9 @@ pub struct Recursion {
     /// Validate answers against the DNSSEC root trust anchor.
     #[serde(default)]
     pub validate: bool,
+    /// File of DS trust anchors (presentation form); empty = built-in root.
+    #[serde(default)]
+    pub trust_anchor_file: Option<PathBuf>,
 }
 
 fn default_recursion_mode() -> String {
@@ -253,6 +256,7 @@ impl Default for Recursion {
             upstreams: vec!["1.1.1.1:53".parse().unwrap(), "8.8.8.8:53".parse().unwrap()],
             allow: vec!["127.0.0.0/8".into(), "::1/128".into()],
             validate: false,
+            trust_anchor_file: None,
         }
     }
 }

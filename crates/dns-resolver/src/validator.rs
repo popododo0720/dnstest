@@ -42,18 +42,38 @@ impl DnssecFetcher for crate::upstream::UpstreamPool {
     }
 }
 
-impl DnssecFetcher for crate::recursor::Recursor {
+impl DnssecFetcher for std::sync::Arc<crate::recursor::Recursor> {
     fn fetch_dnssec<'a>(
         &'a self,
         name: &'a DnsName,
         qtype: u16,
-        metrics: &'a Metrics,
+        _metrics: &'a Metrics,
     ) -> BoxFut<'a, Result<Message, ForwardError>> {
-        Box::pin(self.resolve(name, qtype, metrics))
+        // Run each chain-of-trust fetch on its own task so the deeply nested
+        // validate ↔ recurse future chain never overflows the caller's stack.
+        let this = self.clone();
+        let name = name.clone();
+        Box::pin(async move {
+            match tokio::spawn(async move { this.resolve(&name, qtype).await }).await {
+                Ok(r) => r,
+                Err(_) => Err(ForwardError::Timeout),
+            }
+        })
     }
 }
 
 const MAX_DEPTH: usize = 20;
+/// RFC 9276 §3.2: reject NSEC3 proofs above this iteration count (they only
+/// serve to burn validator CPU). 100 is the historically-tolerated ceiling.
+const MAX_NSEC3_ITERATIONS: u16 = 100;
+
+/// True if any NSEC3 in `records` uses more than `max` hash iterations.
+fn nsec3_iterations_exceed(records: &[Record], max: u16) -> bool {
+    records.iter().filter(|r| r.rtype() == TYPE_NSEC3).any(|r| match &r.rdata {
+        RData::Unknown { data, .. } => data.len() >= 4 && u16::from_be_bytes([data[2], data[3]]) > max,
+        _ => false,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Security {
@@ -86,6 +106,41 @@ impl TrustAnchor {
         ds.push(2); // SHA-256 digest
         ds.extend_from_slice(&digest);
         TrustAnchor { zone: DnsName::root(), ds_rdata: ds }
+    }
+
+    /// Parse a trust anchor from DS presentation form:
+    /// `<zone> [TTL] [IN] DS <keytag> <alg> <digesttype> <hexdigest>`.
+    /// Comment (`;`) and blank lines yield None.
+    pub fn parse(line: &str) -> Result<Option<Self>, String> {
+        let line = line.split(';').next().unwrap_or("").trim();
+        if line.is_empty() {
+            return Ok(None);
+        }
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        let ds_pos = toks
+            .iter()
+            .position(|t| t.eq_ignore_ascii_case("DS"))
+            .ok_or("trust anchor must contain a DS record")?;
+        let zone = DnsName::parse_str(toks.first().ok_or("empty anchor")?)
+            .map_err(|e| format!("bad zone: {e}"))?;
+        let fields = &toks[ds_pos + 1..];
+        if fields.len() < 4 {
+            return Err("DS needs keytag alg digesttype digest".into());
+        }
+        let key_tag: u16 = fields[0].parse().map_err(|_| "bad key tag")?;
+        let alg: u8 = fields[1].parse().map_err(|_| "bad algorithm")?;
+        let digest_type: u8 = fields[2].parse().map_err(|_| "bad digest type")?;
+        let digest_hex: String = fields[3..].concat();
+        let digest = (0..digest_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(digest_hex.get(i..i + 2).unwrap_or("x"), 16))
+            .collect::<Result<Vec<u8>, _>>()
+            .map_err(|_| "bad digest hex")?;
+        let mut ds = key_tag.to_be_bytes().to_vec();
+        ds.push(alg);
+        ds.push(digest_type);
+        ds.extend_from_slice(&digest);
+        Ok(Some(TrustAnchor { zone, ds_rdata: ds }))
     }
 }
 
@@ -133,6 +188,13 @@ impl Validator {
         let answer = self.verify_section(&mut ctx, &msg.answers).await;
         if answer.bogus {
             return Security::Bogus;
+        }
+
+        // RFC 9276: NSEC3 with a high iteration count is a CPU-DoS vector.
+        // We refuse to spend effort validating such a denial and treat it as
+        // insecure rather than authenticated.
+        if nsec3_iterations_exceed(&msg.authorities, MAX_NSEC3_ITERATIONS) {
+            return if answer.any_secure { Security::Secure } else { Security::Insecure };
         }
 
         // 2) When the answer is a denial (NXDOMAIN or NODATA), the NSEC/NSEC3
@@ -251,6 +313,12 @@ impl Validator {
             if let Some(cached) = ctx.keys.get(zone) {
                 return cached.clone();
             }
+            // Mark this zone in-progress *before* recursing into delegated_ds
+            // (which may, through the DS/NSEC path, re-enter dnskeys for the
+            // same zone). A re-entry then hits this placeholder instead of
+            // looping. Every return path below overwrites it with the real
+            // result.
+            ctx.keys.insert(zone.clone(), None);
 
             // Fetch the DNSKEY rrset and its RRSIG.
             let msg = ctx.fetcher.fetch_dnssec(zone, TYPE_DNSKEY, ctx.metrics).await.ok();
@@ -351,26 +419,15 @@ impl Validator {
         let ds_records: Vec<Record> =
             msg.answers.iter().filter(|r| r.rtype() == TYPE_DS).cloned().collect();
         if ds_records.is_empty() {
-            // No DS in the answer. Before declaring the delegation insecure we
-            // must *authenticate* the absence of the DS (anti-downgrade,
-            // RFC 4035 §5): the parent's NSEC/NSEC3 must be validly signed and
-            // must prove there is no DS type at the child name. Otherwise an
-            // attacker who strips the DS could silently disable DNSSEC.
-            let auth = self.verify_section(&mut *ctx, &msg.authorities).await;
-            if auth.bogus {
-                return DsResult::Bogus;
-            }
-            if auth.any_secure && authenticated_no_ds(zone, &msg.authorities) {
-                return DsResult::Insecure;
-            }
-            // Unsigned parent (truly insecure) vs. a stripped DS: if the parent
-            // zone itself is secure we just validated its keys, so a missing
-            // proof here is bogus; an unsigned parent has no NSEC to check.
-            let parent_secure = self
-                .dnskeys(&mut *ctx, &parent, depth + 1)
-                .await
-                .is_some_and(|k| !k.is_empty());
-            return if parent_secure { DsResult::Bogus } else { DsResult::Insecure };
+            // No DS in the answer. Authenticate the *absence* of the DS
+            // (anti-downgrade, RFC 4035 §5) using the parent keys we already
+            // hold — verifying the NSEC/NSEC3 RRSIGs directly, without
+            // re-entering the chain walk (which would loop on the active zone).
+            let denial_ok = authority_signed_by(&msg.authorities, &parent_keys)
+                && authenticated_no_ds(zone, &msg.authorities);
+            // The parent is secure (we validated its keys), so a stripped DS
+            // without a valid proof is bogus; a valid no-DS proof is insecure.
+            return if denial_ok { DsResult::Insecure } else { DsResult::Bogus };
         }
         // The DS rrset must be signed by the parent's validated keys.
         let signed = msg
@@ -410,6 +467,34 @@ struct SectionResult {
 
 fn has_nsec(records: &[Record]) -> bool {
     records.iter().any(|r| matches!(r.rtype(), TYPE_NSEC | TYPE_NSEC3))
+}
+
+/// True if the NSEC/NSEC3 rrsets in `authority` are validly signed by one of
+/// `keys` (used to authenticate a no-DS proof without re-entering the walk).
+fn authority_signed_by(authority: &[Record], keys: &[Vec<u8>]) -> bool {
+    let mut sets: Vec<(DnsName, u16)> = authority
+        .iter()
+        .filter(|r| matches!(r.rtype(), TYPE_NSEC | TYPE_NSEC3))
+        .map(|r| (r.name.clone(), r.rtype()))
+        .collect();
+    sets.sort_by(|a, b| (a.0.to_string(), a.1).cmp(&(b.0.to_string(), b.1)));
+    sets.dedup();
+    if sets.is_empty() {
+        return false;
+    }
+    sets.iter().all(|(owner, rtype)| {
+        let rrset: Vec<Record> =
+            authority.iter().filter(|r| r.name == *owner && r.rtype() == *rtype).cloned().collect();
+        authority
+            .iter()
+            .filter(|r| r.rtype() == TYPE_RRSIG && r.name == *owner)
+            .filter_map(|r| match &r.rdata {
+                RData::Unknown { data, .. } => Some(data),
+                _ => None,
+            })
+            .filter(|d| parse_rrsig(d).map(|f| f.type_covered) == Some(*rtype))
+            .any(|sig| keys.iter().any(|k| verify_rrsig(&rrset, sig, k)))
+    })
 }
 
 /// True if the (already signature-checked) NSEC/NSEC3 records prove that no DS

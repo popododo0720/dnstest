@@ -51,7 +51,8 @@ pub struct Resolver {
     /// Validating-resolver engine (set when DNSSEC validation is enabled).
     validator: Option<Validator>,
     /// Iterative recursive resolver (set in recursive mode; no forwarder).
-    recursor: Option<Recursor>,
+    /// Behind an Arc so DNSSEC fetches can run on their own task stacks.
+    recursor: Option<Arc<Recursor>>,
     cache: Cache,
     flight: Singleflight,
     metrics: Arc<Metrics>,
@@ -71,6 +72,8 @@ pub struct ResolverOptions {
     pub recursive: bool,
     /// Split-horizon views (client ACL → zone set), tried before `zones`.
     pub views: Vec<(dns_guard::Acl, Vec<Zone>)>,
+    /// DNSSEC trust anchors; empty = the built-in root anchor.
+    pub trust_anchors: Vec<TrustAnchor>,
 }
 
 /// Result of the synchronous resolution attempt.
@@ -107,8 +110,14 @@ impl Resolver {
                 .collect(),
             rpz: RwLock::new(Arc::new(opts.rpz)),
             signed: RwLock::new(Arc::new(opts.signed)),
-            validator: opts.validate.then(Validator::with_root),
-            recursor: opts.recursive.then(Recursor::new),
+            validator: opts.validate.then(|| {
+                if opts.trust_anchors.is_empty() {
+                    Validator::with_root()
+                } else {
+                    Validator::new(opts.trust_anchors)
+                }
+            }),
+            recursor: opts.recursive.then(|| Arc::new(Recursor::new(metrics.clone()))),
             cache: Cache::new(opts.cache_size.max(1)),
             flight: Singleflight::default(),
             metrics,
@@ -382,6 +391,12 @@ impl Resolver {
                 Metrics::inc(&self.metrics.upstream_failures);
                 warn!("bogus DNSSEC answer for {} — returning SERVFAIL", p.target);
                 p.resp.flags.rcode = RCODE_SERVFAIL;
+                // Extended DNS Error 6 = DNSSEC Bogus (RFC 8914).
+                let edns = p.resp.edns.get_or_insert_with(dns_proto::message::Edns::ours);
+                edns.set_option(
+                    dns_proto::message::EDNS_EDE,
+                    &dns_proto::message::ede_option(6, "DNSSEC bogus"),
+                );
             }
             Err(e) => {
                 // All upstreams down: serve stale cache data if we have any
@@ -446,7 +461,7 @@ impl Resolver {
                         // No validation: forward plainly, or resolve iteratively.
                         None => match (fwd, &self.recursor) {
                             (Some(p), _) => (p.query(qname, qtype, &self.metrics).await?, false),
-                            (None, Some(r)) => (r.resolve(qname, qtype, &self.metrics).await?, false),
+                            (None, Some(r)) => (r.resolve(qname, qtype).await?, false),
                             (None, None) => {
                                 let p = self.pool.as_ref().ok_or(ForwardError::NoUpstream)?;
                                 (p.query(qname, qtype, &self.metrics).await?, false)

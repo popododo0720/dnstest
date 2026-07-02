@@ -461,6 +461,15 @@ pub struct Edns {
 
 /// EDNS option code for DNS Cookies (RFC 7873).
 pub const EDNS_COOKIE: u16 = 10;
+/// EDNS option code for Extended DNS Errors (RFC 8914).
+pub const EDNS_EDE: u16 = 15;
+
+/// Build an Extended DNS Error option value (info-code + UTF-8 text).
+pub fn ede_option(info_code: u16, text: &str) -> Vec<u8> {
+    let mut v = info_code.to_be_bytes().to_vec();
+    v.extend_from_slice(text.as_bytes());
+    v
+}
 
 impl Edns {
     /// The OPT record this server attaches to its own messages. 1232 bytes is

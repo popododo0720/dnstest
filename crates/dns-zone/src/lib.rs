@@ -451,6 +451,15 @@ pub fn parse_zone_file(text: &str) -> Result<Zone, ZoneError> {
             default_ttl = parse_num(arg.text(), line_no, "$TTL")?;
             continue;
         }
+        if first.eq_ignore_ascii_case("$GENERATE") {
+            let origin = origin
+                .as_ref()
+                .ok_or_else(|| err(line_no, "$GENERATE before $ORIGIN"))?;
+            for rec in expand_generate(&toks, origin, default_ttl, line_no)? {
+                all.push((line_no, rec));
+            }
+            continue;
+        }
 
         let origin = origin
             .as_ref()
@@ -494,6 +503,97 @@ pub fn parse_zone_file(text: &str) -> Result<Zone, ZoneError> {
     let origin = origin.ok_or_else(|| err(0, "zone file has no $ORIGIN directive"))?;
     Zone::from_records(origin, all.into_iter().map(|(_, r)| r).collect())
         .map_err(|msg| err(0, msg))
+}
+
+/// Expand a `$GENERATE range lhs [ttl] [class] type rhs` directive (BIND
+/// syntax) into concrete records. `$` in lhs/rhs is the iterator; the
+/// `${offset,width,base}` form applies an offset and zero-pads.
+fn expand_generate(
+    toks: &[Tok],
+    origin: &DnsName,
+    default_ttl: u32,
+    line_no: usize,
+) -> Result<Vec<Record>, ZoneError> {
+    // toks: $GENERATE range lhs [ttl] [class] type rhs...
+    let range = toks.get(1).ok_or_else(|| err(line_no, "$GENERATE needs a range"))?.text();
+    let lhs = toks.get(2).ok_or_else(|| err(line_no, "$GENERATE needs an lhs"))?.text();
+    let mut i = 3;
+    let mut ttl = default_ttl;
+    while let Some(t) = toks.get(i).map(Tok::text) {
+        if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) {
+            ttl = parse_num(t, line_no, "TTL")?;
+            i += 1;
+        } else if t.eq_ignore_ascii_case("IN") {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    let rtype = toks.get(i).ok_or_else(|| err(line_no, "$GENERATE needs a type"))?.text().to_ascii_uppercase();
+    let rhs: String = toks[i + 1..].iter().map(Tok::text).collect::<Vec<_>>().join(" ");
+
+    // Parse "start-stop[/step]".
+    let (span, step) = match range.split_once('/') {
+        Some((s, st)) => (s, parse_num::<i64>(st, line_no, "$GENERATE step")?),
+        None => (range, 1),
+    };
+    let (start, stop) = span
+        .split_once('-')
+        .ok_or_else(|| err(line_no, "$GENERATE range must be start-stop"))?;
+    let start: i64 = parse_num(start, line_no, "$GENERATE start")?;
+    let stop: i64 = parse_num(stop, line_no, "$GENERATE stop")?;
+    if step <= 0 || stop < start || (stop - start) / step > 1_000_000 {
+        return Err(err(line_no, "$GENERATE range is empty or too large"));
+    }
+
+    let mut out = Vec::new();
+    let mut n = start;
+    while n <= stop {
+        let owner = resolve_name(&gen_subst(lhs, n), origin, line_no)?;
+        let rdata_str = gen_subst(&rhs, n);
+        let rdata = rdata_from_text(&rtype, &rdata_str, origin).map_err(|e| err(line_no, e))?;
+        out.push(Record { name: owner, class: CLASS_IN, ttl, rdata });
+        n += step;
+    }
+    Ok(out)
+}
+
+/// Substitute the `$` iterator in a `$GENERATE` template. Supports the plain
+/// `$` and the `${offset,width,base}` modifier (base d/o/x/X).
+fn gen_subst(template: &str, value: i64) -> String {
+    let mut out = String::new();
+    let chars: Vec<char> = template.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '$' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // `$` — possibly `${offset,width,base}`.
+        if chars.get(i + 1) == Some(&'{') {
+            if let Some(close) = chars[i + 2..].iter().position(|&c| c == '}') {
+                let spec: String = chars[i + 2..i + 2 + close].iter().collect();
+                let parts: Vec<&str> = spec.split(',').collect();
+                let offset: i64 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let width: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                let base = parts.get(2).copied().unwrap_or("d");
+                let v = value + offset;
+                let s = match base {
+                    "o" => format!("{v:o}"),
+                    "x" => format!("{v:x}"),
+                    "X" => format!("{v:X}"),
+                    _ => format!("{v}"),
+                };
+                out.push_str(&format!("{s:0>width$}"));
+                i += 2 + close + 1;
+                continue;
+            }
+        }
+        out.push_str(&value.to_string());
+        i += 1;
+    }
+    out
 }
 
 fn resolve_name(token: &str, origin: &DnsName, line_no: usize) -> Result<DnsName, ZoneError> {
@@ -884,6 +984,25 @@ _http._tcp IN SRV 0 5 8080 www
         let nuke = Record { name: n("t"), class: CLASS_ANY, ttl: 0, rdata: RData::Unknown { rtype: TYPE_ANY, data: vec![] } };
         z.apply_update(&[], &[nuke]);
         assert!(z.lookup(&n("t"), dns_proto::message::TYPE_SOA).answers.len() == 1);
+    }
+
+    #[test]
+    fn generate_directive_expands() {
+        use dns_proto::message::TYPE_A;
+        let z = parse_zone_file(
+            "$ORIGIN t.\n$TTL 300\n@ IN SOA ns h 1 2 3 4 5\n\
+             $GENERATE 1-4 host$ A 10.0.0.$\n\
+             $GENERATE 10-12/2 srv-${0,3,d} A 10.0.1.${100,0,d}\n",
+        )
+        .unwrap();
+        // host1..host4 with matching last octet.
+        assert_eq!(z.lookup(&n("host1.t"), TYPE_A).answers[0].rdata.text(), "10.0.0.1");
+        assert_eq!(z.lookup(&n("host4.t"), TYPE_A).answers[0].rdata.text(), "10.0.0.4");
+        assert_eq!(z.lookup(&n("host5.t"), TYPE_A).rcode, dns_proto::message::RCODE_NXDOMAIN);
+        // Step 2 + zero-padded width + offset: srv-010 -> 10.0.1.110.
+        assert_eq!(z.lookup(&n("srv-010.t"), TYPE_A).answers[0].rdata.text(), "10.0.1.110");
+        assert_eq!(z.lookup(&n("srv-012.t"), TYPE_A).answers[0].rdata.text(), "10.0.1.112");
+        assert_eq!(z.lookup(&n("srv-011.t"), TYPE_A).rcode, dns_proto::message::RCODE_NXDOMAIN);
     }
 
     #[test]

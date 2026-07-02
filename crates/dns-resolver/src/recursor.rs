@@ -1,8 +1,10 @@
 //! Iterative recursive resolver (RFC 1034 §4.3.2): resolves a name from the
 //! root down, following NS referrals and glue, with no upstream forwarder.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use dns_metrics::Metrics;
 use dns_proto::message::{
@@ -18,10 +20,9 @@ use crate::upstream::ForwardError;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Bound on referral hops before giving up (loop / very deep delegation guard).
 const MAX_REFERRALS: usize = 30;
-/// Bound on CNAME redirections within one resolution.
-const MAX_CNAMES: usize = 12;
-/// Bound on nested resolutions to resolve a glueless NS name.
-const MAX_GLUELESS_DEPTH: usize = 6;
+/// Hard bound on total nested resolutions (glueless NS + CNAME chase)
+/// per resolution — prevents stack growth from CNAME loops or deep chains.
+const MAX_DEPTH: usize = 24;
 
 /// The IANA root name servers (A records), used as resolution seeds.
 const ROOT_HINTS: [&str; 13] = [
@@ -40,51 +41,126 @@ const ROOT_HINTS: [&str; 13] = [
     "202.12.27.33",  // m
 ];
 
+/// How long a learned delegation (zone → name-server addresses) is reused
+/// before re-fetching it from the parent.
+const DELEGATION_TTL: Duration = Duration::from_secs(600);
+
 pub struct Recursor {
     roots: Vec<SocketAddr>,
-}
-
-impl Default for Recursor {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Learned delegations so a cache miss starts from the deepest known zone
+    /// cut instead of the root (zone → addresses, with an expiry).
+    delegations: RwLock<HashMap<DnsName, (Vec<SocketAddr>, Instant)>>,
+    /// Answer cache keyed on (name, type) — crucial for validation, which
+    /// re-fetches DNSKEY/DS for the whole chain of trust.
+    answers: RwLock<HashMap<(DnsName, u16), (Message, Instant)>>,
+    metrics: Arc<Metrics>,
 }
 
 impl Recursor {
-    pub fn new() -> Self {
+    pub fn new(metrics: Arc<Metrics>) -> Self {
         let roots = ROOT_HINTS
             .iter()
             .map(|ip| SocketAddr::new(ip.parse::<IpAddr>().unwrap(), 53))
             .collect();
-        Recursor { roots }
+        Recursor {
+            roots,
+            delegations: RwLock::new(HashMap::new()),
+            answers: RwLock::new(HashMap::new()),
+            metrics,
+        }
     }
 
-    /// Resolve (qname, qtype) iteratively from the root.
-    pub async fn resolve(
-        &self,
-        qname: &DnsName,
-        qtype: u16,
-        metrics: &Metrics,
-    ) -> Result<Message, ForwardError> {
-        self.resolve_depth(qname, qtype, metrics, 0).await
+    /// The deepest cached delegation that is an ancestor of `qname`, if fresh.
+    /// `min_skip` skips that many leading labels: a DS query must be answered
+    /// by the *parent* zone, so it starts one label up (min_skip = 1) to avoid
+    /// landing on the child's own servers, which do not hold their DS.
+    fn cached_start(&self, qname: &DnsName, min_skip: usize) -> Option<(DnsName, Vec<SocketAddr>)> {
+        let map = self.delegations.read().unwrap();
+        let now = Instant::now();
+        let labels = qname.labels();
+        for skip in min_skip..labels.len() {
+            if let Ok(cand) = DnsName::from_labels(labels[skip..].to_vec()) {
+                if let Some((servers, exp)) = map.get(&cand) {
+                    if *exp > now {
+                        return Some((cand, servers.clone()));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn cache_delegation(&self, zone: DnsName, servers: Vec<SocketAddr>) {
+        if servers.is_empty() || zone.is_root() {
+            return;
+        }
+        let mut map = self.delegations.write().unwrap();
+        if map.len() > 100_000 {
+            let now = Instant::now();
+            map.retain(|_, (_, exp)| *exp > now);
+        }
+        map.insert(zone, (servers, Instant::now() + DELEGATION_TTL));
+    }
+
+    /// Resolve (qname, qtype) iteratively from the root, with an answer cache
+    /// so repeated lookups (notably DNSSEC DNSKEY/DS chains) are cheap.
+    pub async fn resolve(&self, qname: &DnsName, qtype: u16) -> Result<Message, ForwardError> {
+        let key = (qname.clone(), qtype);
+        {
+            let cache = self.answers.read().unwrap();
+            if let Some((msg, exp)) = cache.get(&key) {
+                if *exp > Instant::now() {
+                    Metrics::inc(&self.metrics.cache_hits);
+                    return Ok(msg.clone());
+                }
+            }
+        }
+        let msg = self.resolve_depth(qname, qtype, 0).await?;
+        // Cache positive/negative answers for the min answer TTL (bounded).
+        let ttl = msg
+            .answers
+            .iter()
+            .map(|r| r.ttl)
+            .min()
+            .unwrap_or(300)
+            .clamp(5, 3600);
+        let mut cache = self.answers.write().unwrap();
+        if cache.len() > 100_000 {
+            let now = Instant::now();
+            cache.retain(|_, (_, exp)| *exp > now);
+        }
+        cache.insert(key, (msg.clone(), Instant::now() + Duration::from_secs(ttl as u64)));
+        Ok(msg)
     }
 
     fn resolve_depth<'a>(
         &'a self,
         qname: &'a DnsName,
         qtype: u16,
-        metrics: &'a Metrics,
-        glueless_depth: usize,
+        depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Message, ForwardError>> + Send + 'a>>
     {
         Box::pin(async move {
-            let mut cnames = 0;
+            if depth > MAX_DEPTH {
+                return Err(ForwardError::Timeout);
+            }
             let full_labels = qname.label_count();
-            let mut servers = self.roots.clone();
-            // Labels of the zone we are currently talking to (root = 0). The
-            // next query reveals exactly one more label (QNAME minimization,
-            // RFC 9156) until we reach the full name.
-            let mut zone_depth = 0usize;
+            // Start from the deepest cached delegation when we have one,
+            // otherwise the root. `current_zone` is the zone the current
+            // servers are authoritative for (bailiwick anchor).
+            // A DS query is answered by the parent zone; never start from a
+            // cached delegation for the exact name (the child lacks its DS).
+            let min_skip = if qtype == dns_proto::message::TYPE_DS { 1 } else { 0 };
+            let (mut servers, mut current_zone, mut zone_depth) =
+                match self.cached_start(qname, min_skip) {
+                    Some((zone, s)) => {
+                        let d = zone.label_count();
+                        (s, zone, d)
+                    }
+                    None => (self.roots.clone(), DnsName::root(), 0usize),
+                };
+            // The next query reveals exactly one more label than the zone cut
+            // (QNAME minimization, RFC 9156) until we reach the full name.
             let mut minimize = true;
 
             for _ in 0..MAX_REFERRALS {
@@ -95,7 +171,7 @@ impl Recursor {
                 // real type.
                 let step_type = if is_full { qtype } else { TYPE_NS };
 
-                let resp = match self.query_servers(&servers, &min_name, step_type, metrics).await {
+                let resp = match self.query_servers(&servers, &min_name, step_type).await {
                     Some(r) => r,
                     None => return Err(ForwardError::Timeout),
                 };
@@ -135,12 +211,8 @@ impl Recursor {
                             {
                                 let resolved = resp.answers.iter().any(|r| r.rtype() == qtype);
                                 if !resolved {
-                                    cnames += 1;
-                                    if cnames > MAX_CNAMES {
-                                        return Err(ForwardError::Timeout);
-                                    }
                                     let mut chased = self
-                                        .resolve_depth(&target, qtype, metrics, glueless_depth)
+                                        .resolve_depth(&target, qtype, depth + 1)
                                         .await?;
                                     let mut answers = resp.answers.clone();
                                     answers.append(&mut chased.answers);
@@ -162,15 +234,42 @@ impl Recursor {
                 }
 
                 if !ns_names.is_empty() {
-                    // Descend into the delegation. The new zone cut is the NS
-                    // owner's depth (or at least one deeper than now).
-                    let new_depth = ns_owner.map(|n| n.label_count()).unwrap_or(keep);
-                    zone_depth = new_depth.max(zone_depth + 1);
-                    servers = match self.referral_addrs(&resp, &ns_names, glueless_depth, metrics).await
+                    let new_zone = ns_owner.clone().unwrap_or_else(|| min_name.clone());
+                    // DS lives in the PARENT zone (RFC 4034 §5): once the
+                    // referral is for the exact queried name, we have reached
+                    // the parent — do not descend into the child, answer from
+                    // the parent's response (which carries the DS or the
+                    // NSEC/NSEC3 proving its absence).
+                    if qtype == dns_proto::message::TYPE_DS && new_zone == *qname {
+                        return Ok(finalize(resp, qname, qtype));
+                    }
+                    // Bailiwick (RFC 5452 / cache-poisoning defense): a valid
+                    // referral must be *within* the zone we asked and strictly
+                    // deeper. Reject out-of-zone or non-progressing delegations.
+                    if !new_zone.ends_with(&current_zone)
+                        || new_zone.label_count() <= current_zone.label_count()
+                    {
+                        if minimize && !is_full {
+                            minimize = false; // retry this step with the full name
+                            continue;
+                        }
+                        return Ok(finalize(resp, qname, qtype));
+                    }
+                    // Glue is trusted only when in-bailiwick of the zone we
+                    // just queried (`current_zone`) — a server may legitimately
+                    // supply glue for any name within its own zone (e.g. root
+                    // gives gtld-servers.net glue for .com). Out-of-bailiwick
+                    // glue is discarded and the NS name resolved from scratch.
+                    servers = match self
+                        .referral_addrs(&resp, &ns_names, &current_zone, depth)
+                        .await
                     {
                         Some(s) => s,
                         None => return Err(ForwardError::Timeout),
                     };
+                    self.cache_delegation(new_zone.clone(), servers.clone());
+                    zone_depth = new_zone.label_count().max(zone_depth + 1);
+                    current_zone = new_zone;
                     continue;
                 }
 
@@ -191,19 +290,20 @@ impl Recursor {
         })
     }
 
-    /// Resolve the addresses to talk to for a referral, using glue or, when
-    /// glueless, resolving an NS name's A record.
+    /// Addresses to talk to for a referral into `zone`. Glue is trusted only
+    /// when the NS name is in-bailiwick (a subdomain of `zone`); out-of-
+    /// bailiwick NS names are resolved from scratch to avoid poisoned glue.
     async fn referral_addrs(
         &self,
         resp: &Message,
         ns_names: &[DnsName],
-        glueless_depth: usize,
-        metrics: &Metrics,
+        zone: &DnsName,
+        depth: usize,
     ) -> Option<Vec<SocketAddr>> {
         let mut next: Vec<SocketAddr> = resp
             .additionals
             .iter()
-            .filter(|r| ns_names.contains(&r.name))
+            .filter(|r| ns_names.contains(&r.name) && r.name.ends_with(zone))
             .filter_map(|r| match &r.rdata {
                 RData::A(ip) => Some(SocketAddr::new((*ip).into(), 53)),
                 RData::Aaaa(ip) => Some(SocketAddr::new((*ip).into(), 53)),
@@ -211,11 +311,11 @@ impl Recursor {
             })
             .collect();
         if next.is_empty() {
-            if glueless_depth >= MAX_GLUELESS_DEPTH {
+            if depth >= MAX_DEPTH {
                 return None;
             }
             for ns in ns_names {
-                if let Ok(m) = self.resolve_depth(ns, TYPE_A, metrics, glueless_depth + 1).await {
+                if let Ok(m) = self.resolve_depth(ns, TYPE_A, depth + 1).await {
                     next.extend(m.answers.iter().filter_map(|r| match &r.rdata {
                         RData::A(ip) => Some(SocketAddr::new((*ip).into(), 53)),
                         _ => None,
@@ -235,14 +335,13 @@ impl Recursor {
         servers: &[SocketAddr],
         qname: &DnsName,
         qtype: u16,
-        metrics: &Metrics,
     ) -> Option<Message> {
         for &server in servers.iter().take(4) {
-            Metrics::inc(&metrics.upstream_queries);
+            Metrics::inc(&self.metrics.upstream_queries);
             match query_one(server, qname, qtype).await {
                 Ok(m) => return Some(m),
                 Err(_) => {
-                    Metrics::inc(&metrics.upstream_failures);
+                    Metrics::inc(&self.metrics.upstream_failures);
                     continue;
                 }
             }

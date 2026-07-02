@@ -45,6 +45,8 @@ delegation tree with no upstream — a full recursive resolver with QNAME
 minimization (RFC 9156: intermediate queries reveal only one more label at a
 time). Both modes share the cache, singleflight, RPZ, and DNSSEC validation.
 Conditional forwarding (`[[forward]]`) overrides the mode for specific zones.
+The recursor enforces bailiwick (rejecting out-of-zone NS/glue as a cache-
+poisoning defense) and caches delegations and answers.
 
 ## Record types
 
@@ -52,7 +54,7 @@ The typed rdata parsers cover A, AAAA, NS, CNAME, SOA, PTR, MX, TXT, SRV, and
 CAA. Any other type — TLSA, SVCB, HTTPS, NAPTR, DS, DNSKEY, … — is authorable in
 zone files and over the API using the RFC 3597 generic form
 (`name TTL IN TYPE52 \# <len> <hex>`), and all types forward and cache
-transparently.
+transparently. Zone files also support `$GENERATE` and `$INCLUDE`.
 
 ## Dynamic updates (RFC 2136)
 
@@ -117,7 +119,10 @@ records including range coverage and closest-encloser proofs; and insecure
 delegations are only accepted when the absence of a DS is itself proven by the
 parent's NSEC/NSEC3 (including opt-out), closing the downgrade gap. Securely-
 validated answers set the AD bit — preserved across cache hits — while forged or
-broken chains return SERVFAIL and provably-unsigned zones pass through.
+broken chains return SERVFAIL (with an Extended DNS Error, RFC 8914) and
+provably-unsigned zones pass through. NSEC3 proofs above 100 iterations are
+refused (RFC 9276 anti-DoS). Trust anchors default to the built-in root KSK but
+can be supplied via `recursion.trust_anchor_file` (DS presentation form).
 
 Verified against the live internet: valid signatures (ECDSA and RSA, including
 1024-bit ZSKs) set AD on both positive and NXDOMAIN/NODATA answers, while

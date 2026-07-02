@@ -56,8 +56,11 @@ fn load_zones(explicit: &[PathBuf], zone_dir: Option<&Path>) -> Result<Vec<Zone>
     }
     let mut zones: Vec<Zone> = Vec::new();
     for path in paths {
+        let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let text = expand_includes(&text, &base, 0)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let zone =
             dns_zone::parse_zone_file(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         if zones.iter().any(|z| z.origin == zone.origin) {
@@ -67,6 +70,46 @@ fn load_zones(explicit: &[PathBuf], zone_dir: Option<&Path>) -> Result<Vec<Zone>
         zones.push(zone);
     }
     Ok(zones)
+}
+
+/// Expand `$INCLUDE "file" [origin]` directives (RFC 1035) textually, relative
+/// to `base`. An optional origin is scoped to the included file by bracketing
+/// it with `$ORIGIN` directives.
+fn expand_includes(text: &str, base: &Path, depth: usize) -> Result<String, String> {
+    if depth > 8 {
+        return Err("$INCLUDE nested too deeply".into());
+    }
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed
+            .strip_prefix("$INCLUDE")
+            .or_else(|| trimmed.strip_prefix("$include"))
+        {
+            let mut parts = rest.split_whitespace();
+            let file = parts
+                .next()
+                .ok_or("$INCLUDE needs a file")?
+                .trim_matches('"');
+            let inc_origin = parts.next();
+            let inc_path = base.join(file);
+            let inc_text = std::fs::read_to_string(&inc_path)
+                .map_err(|e| format!("$INCLUDE {}: {e}", inc_path.display()))?;
+            let inc_base = inc_path.parent().map(Path::to_path_buf).unwrap_or_default();
+            let expanded = expand_includes(&inc_text, &inc_base, depth + 1)?;
+            if let Some(o) = inc_origin {
+                // Scope the origin to the include, per RFC 1035.
+                out.push_str(&format!("$ORIGIN {o}\n{expanded}\n"));
+            } else {
+                out.push_str(&expanded);
+                out.push('\n');
+            }
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    Ok(out)
 }
 
 fn load_rpz(cfg: &config::Config) -> Result<Rpz, String> {
@@ -167,8 +210,18 @@ fn load_dnssec_keys(
     Ok(Some((keys, origins)))
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Recursive DNSSEC validation nests deep chains of async futures (validate
+    // the chain of trust × iterative resolution). Give worker threads a large
+    // stack so those poll chains never overflow.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(16 * 1024 * 1024)
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("rdns=info")),
@@ -210,6 +263,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let rpz = load_rpz(&cfg)?;
 
+    // DNSSEC trust anchors (default to the built-in root).
+    let mut trust_anchors = Vec::new();
+    if let Some(path) = &cfg.recursion.trust_anchor_file {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        for line in text.lines() {
+            if let Some(a) = dns_resolver::TrustAnchor::parse(line)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+            {
+                trust_anchors.push(a);
+            }
+        }
+        info!("loaded {} DNSSEC trust anchor(s)", trust_anchors.len());
+    }
+
     // Split-horizon views: each is a client ACL plus its own zone set.
     let mut views: Vec<(Acl, Vec<Zone>)> = Vec::new();
     for v in &cfg.views {
@@ -240,6 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             validate: cfg.recursion.validate,
             recursive,
             views,
+            trust_anchors,
         },
         metrics.clone(),
     ));
