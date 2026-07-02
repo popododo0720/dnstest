@@ -1,0 +1,7 @@
+[package]
+name = "dns-metrics"
+description = "Atomic counters and Prometheus text exposition"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

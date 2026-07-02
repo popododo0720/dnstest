@@ -1,46 +1,102 @@
 //! Query resolution: authoritative zones first, then the cache, then the
-//! upstream forwarder.
+//! upstream pool.
+//!
+//! The hot path is split in two so transports can answer most queries without
+//! spawning a task: [`Resolver::resolve_local`] is synchronous and handles
+//! everything answerable from zones and cache; only queries that genuinely
+//! need upstream traffic return [`Outcome::Pending`] and go through the
+//! asynchronous [`Resolver::resolve_pending`].
 
-use std::fmt;
+mod flight;
+mod upstream;
+
+pub use upstream::ForwardError;
+
 use std::net::SocketAddr;
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
-
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
-use tokio::time::timeout;
-use tracing::{debug, warn};
+use std::sync::{Arc, RwLock};
 
 use dns_cache::{Cache, Key};
+use dns_metrics::Metrics;
 use dns_proto::message::{
-    CLASS_ANY, CLASS_IN, Edns, Flags, Message, Question, RCODE_FORMERR, RCODE_NOTIMP,
-    RCODE_REFUSED, RCODE_SERVFAIL, Record, TYPE_SOA,
+    CLASS_ANY, CLASS_IN, Message, RCODE_FORMERR, RCODE_NOTIMP, RCODE_REFUSED, RCODE_SERVFAIL,
+    Record, TYPE_SOA,
 };
 use dns_proto::name::DnsName;
 use dns_zone::Zone;
+use tracing::warn;
 
-const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
-const UPSTREAM_ATTEMPTS: usize = 2;
+use crate::flight::{Role, Singleflight};
+use crate::upstream::UpstreamPool;
 
 pub struct Resolver {
-    zones: Vec<Zone>,
-    upstream: Option<SocketAddr>,
+    zones: RwLock<Arc<Vec<Zone>>>,
+    pool: Option<UpstreamPool>,
     cache: Cache,
+    flight: Singleflight,
+    metrics: Arc<Metrics>,
+}
+
+/// Result of the synchronous resolution attempt.
+pub enum Outcome {
+    Done(Message),
+    Pending(Pending),
+}
+
+/// A response that still needs upstream traffic to complete.
+pub struct Pending {
+    resp: Message,
+    target: DnsName,
+    qtype: u16,
+    /// true: append to an authoritative CNAME chain; false: fill the whole
+    /// response.
+    append: bool,
 }
 
 impl Resolver {
-    pub fn new(zones: Vec<Zone>, upstream: Option<SocketAddr>, cache_size: usize) -> Self {
-        Resolver { zones, upstream, cache: Cache::new(cache_size) }
+    pub fn new(
+        zones: Vec<Zone>,
+        upstreams: Vec<SocketAddr>,
+        cache_size: usize,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Resolver {
+            zones: RwLock::new(Arc::new(zones)),
+            pool: UpstreamPool::new(upstreams),
+            cache: Cache::new(cache_size),
+            flight: Singleflight::default(),
+            metrics,
+        }
     }
 
-    fn find_zone(&self, name: &DnsName) -> Option<&Zone> {
-        self.zones
-            .iter()
-            .filter(|z| name.ends_with(&z.origin))
-            .max_by_key(|z| z.origin.label_count())
+    /// Current zone set (cheap snapshot for readers).
+    pub fn zones(&self) -> Arc<Vec<Zone>> {
+        self.zones.read().unwrap().clone()
     }
 
-    pub async fn handle(&self, query: &Message) -> Message {
+    /// Atomically replace the zone set (API edits, SIGHUP reload).
+    pub fn set_zones(&self, zones: Vec<Zone>) {
+        *self.zones.write().unwrap() = Arc::new(zones);
+    }
+
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
+    }
+
+    /// Full resolution; convenience for transports that do not use the
+    /// sync/async split.
+    pub async fn handle(&self, query: &Message, recursion_allowed: bool) -> Message {
+        match self.resolve_local(query, recursion_allowed) {
+            Outcome::Done(m) => m,
+            Outcome::Pending(p) => self.resolve_pending(p).await,
+        }
+    }
+
+    /// Synchronous fast path: validation, authoritative zones, and cache.
+    pub fn resolve_local(&self, query: &Message, recursion_allowed: bool) -> Outcome {
         let mut resp = Message::response_to(query);
 
         // RFC 6891: unknown EDNS version gets BADVERS (extended rcode 16 =
@@ -50,26 +106,27 @@ impl Resolver {
                 if let Some(re) = &mut resp.edns {
                     re.ext_rcode = 1;
                 }
-                return resp;
+                return Outcome::Done(resp);
             }
         }
         if query.flags.opcode != 0 {
             resp.flags.rcode = RCODE_NOTIMP;
-            return resp;
+            return Outcome::Done(resp);
         }
         if query.questions.len() != 1 {
             resp.flags.rcode = RCODE_FORMERR;
-            return resp;
+            return Outcome::Done(resp);
         }
         let q = &query.questions[0];
         if q.qclass != CLASS_IN && q.qclass != CLASS_ANY {
             resp.flags.rcode = RCODE_NOTIMP;
-            return resp;
+            return Outcome::Done(resp);
         }
-        resp.flags.ra = self.upstream.is_some();
+        resp.flags.ra = self.pool.is_some() && recursion_allowed;
 
         // Authoritative data wins over forwarding.
-        if let Some(zone) = self.find_zone(&q.qname) {
+        let zones = self.zones();
+        if let Some(zone) = find_zone(&zones, &q.qname) {
             resp.flags.aa = true;
             let result = zone.lookup(&q.qname, q.qtype);
             resp.flags.rcode = result.rcode;
@@ -77,223 +134,139 @@ impl Resolver {
             if result.negative {
                 resp.authorities.push(zone.soa.clone());
             }
-            // A CNAME chain that leaves the zone: keep resolving upstream if
-            // the client asked for recursion.
+            // A CNAME chain that leaves the zone: keep resolving if the
+            // client asked for recursion and is allowed to use it.
             if let Some(target) = result.offsite {
-                if query.flags.rd && self.upstream.is_some() {
-                    match self.resolve_external(&target, q.qtype).await {
-                        Ok((rcode, mut answers, mut authorities)) => {
-                            if answers.is_empty() {
-                                resp.authorities.append(&mut authorities);
-                            }
-                            resp.answers.append(&mut answers);
-                            resp.flags.rcode = rcode;
-                        }
-                        Err(e) => {
-                            warn!("offsite CNAME {target} resolution failed: {e}");
-                            resp.flags.rcode = RCODE_SERVFAIL;
-                        }
+                if query.flags.rd && self.pool.is_some() && recursion_allowed {
+                    let key = Key { qname: target.clone(), qtype: q.qtype };
+                    if let Some(hit) = self.cache_get(&key) {
+                        merge(&mut resp, hit, true);
+                        return Outcome::Done(resp);
                     }
+                    return Outcome::Pending(Pending {
+                        resp,
+                        target,
+                        qtype: q.qtype,
+                        append: true,
+                    });
                 }
-                // Without RD the client gets the bare CNAME and follows it.
+                // Without recursion the client gets the bare CNAME.
             }
-            return resp;
+            return Outcome::Done(resp);
         }
 
-        if !query.flags.rd || self.upstream.is_none() {
+        if !query.flags.rd || self.pool.is_none() {
             resp.flags.rcode = RCODE_REFUSED;
-            return resp;
+            return Outcome::Done(resp);
         }
-        match self.resolve_external(&q.qname, q.qtype).await {
-            Ok((rcode, answers, authorities)) => {
-                resp.flags.rcode = rcode;
-                resp.answers = answers;
-                resp.authorities = authorities;
-            }
-            Err(e) => {
-                warn!("upstream lookup {} {} failed: {e}", q.qname, q.qtype);
-                resp.flags.rcode = RCODE_SERVFAIL;
-            }
+        if !recursion_allowed {
+            Metrics::inc(&self.metrics.recursion_refused);
+            resp.flags.rcode = RCODE_REFUSED;
+            return Outcome::Done(resp);
         }
-        resp
+        let key = Key { qname: q.qname.clone(), qtype: q.qtype };
+        if let Some(hit) = self.cache_get(&key) {
+            merge(&mut resp, hit, false);
+            return Outcome::Done(resp);
+        }
+        Outcome::Pending(Pending { resp, target: q.qname.clone(), qtype: q.qtype, append: false })
     }
 
-    /// Cache-through lookup against the upstream resolver.
+    /// Complete a pending response with upstream traffic.
+    pub async fn resolve_pending(&self, mut p: Pending) -> Message {
+        match self.resolve_external(&p.target, p.qtype).await {
+            Ok(hit) => merge(&mut p.resp, hit, p.append),
+            Err(e) => {
+                warn!("upstream lookup {} type{} failed: {e}", p.target, p.qtype);
+                p.resp.flags.rcode = RCODE_SERVFAIL;
+            }
+        }
+        p.resp
+    }
+
+    fn cache_get(&self, key: &Key) -> Option<(u8, Vec<Record>, Vec<Record>)> {
+        let hit = self.cache.get(key);
+        if hit.is_some() {
+            Metrics::inc(&self.metrics.cache_hits);
+        }
+        hit
+    }
+
+    /// Cache-through, singleflight-deduplicated upstream lookup.
     async fn resolve_external(
         &self,
         qname: &DnsName,
         qtype: u16,
     ) -> Result<(u8, Vec<Record>, Vec<Record>), ForwardError> {
         let key = Key { qname: qname.clone(), qtype };
-        if let Some(hit) = self.cache.get(&key) {
-            debug!("cache hit for {qname}");
-            return Ok(hit);
-        }
-        let upstream = self.upstream.ok_or(ForwardError::NoUpstream)?;
-        let msg = forward_query(upstream, qname, qtype).await?;
-        // Keep only the SOA from the authority section — it is what negative
-        // caching and NXDOMAIN responses need; NS referrals are upstream noise.
-        let authorities: Vec<Record> =
-            msg.authorities.iter().filter(|r| r.rtype() == TYPE_SOA).cloned().collect();
-        self.cache
-            .insert(key, msg.flags.rcode, msg.answers.clone(), authorities.clone());
-        Ok((msg.flags.rcode, msg.answers, authorities))
-    }
-}
-
-#[derive(Debug)]
-pub enum ForwardError {
-    Io(std::io::Error),
-    Timeout,
-    NoUpstream,
-}
-
-impl fmt::Display for ForwardError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ForwardError::Io(e) => write!(f, "i/o error: {e}"),
-            ForwardError::Timeout => write!(f, "upstream timed out"),
-            ForwardError::NoUpstream => write!(f, "no upstream configured"),
-        }
-    }
-}
-
-impl std::error::Error for ForwardError {}
-
-impl From<std::io::Error> for ForwardError {
-    fn from(e: std::io::Error) -> Self {
-        ForwardError::Io(e)
-    }
-}
-
-async fn forward_query(
-    upstream: SocketAddr,
-    qname: &DnsName,
-    qtype: u16,
-) -> Result<Message, ForwardError> {
-    let mut query = Message::new(random_id(), Flags { rd: true, ..Flags::default() });
-    query
-        .questions
-        .push(Question { qname: qname.clone(), qtype, qclass: CLASS_IN });
-    query.edns = Some(Edns::ours());
-    let wire = query.encode();
-
-    let mut last_err = ForwardError::Timeout;
-    for _ in 0..UPSTREAM_ATTEMPTS {
-        match udp_exchange(upstream, &wire, &query).await {
-            Ok(m) if m.flags.tc => {
-                debug!("upstream response truncated, retrying over TCP");
-                return tcp_exchange(upstream, &wire, &query).await;
+        for _ in 0..3 {
+            if let Some(hit) = self.cache_get(&key) {
+                return Ok(hit);
             }
-            Ok(m) => return Ok(m),
-            Err(e) => last_err = e,
-        }
-    }
-    Err(last_err)
-}
-
-/// True if `m` is a plausible reply to `query` (id, QR bit and question echo
-/// all match) — the standard defense against stale and spoofed datagrams.
-fn is_reply_to(m: &Message, query: &Message) -> bool {
-    m.id == query.id
-        && m.flags.qr
-        && m.questions.first().is_some_and(|got| {
-            let want = &query.questions[0];
-            got.qname == want.qname && got.qtype == want.qtype
-        })
-}
-
-async fn udp_exchange(
-    upstream: SocketAddr,
-    wire: &[u8],
-    query: &Message,
-) -> Result<Message, ForwardError> {
-    let bind_addr: SocketAddr = if upstream.is_ipv4() {
-        "0.0.0.0:0".parse().unwrap()
-    } else {
-        "[::]:0".parse().unwrap()
-    };
-    let sock = UdpSocket::bind(bind_addr).await?;
-    sock.connect(upstream).await?;
-    sock.send(wire).await?;
-
-    let mut buf = [0u8; 2048];
-    timeout(UPSTREAM_TIMEOUT, async {
-        loop {
-            let n = sock.recv(&mut buf).await?;
-            if let Ok(m) = Message::parse(&buf[..n]) {
-                if is_reply_to(&m, query) {
-                    return Ok(m);
+            match self.flight.begin(&key) {
+                Role::Leader(_guard) => {
+                    Metrics::inc(&self.metrics.cache_misses);
+                    let pool = self.pool.as_ref().ok_or(ForwardError::NoUpstream)?;
+                    let msg = pool.query(qname, qtype, &self.metrics).await?;
+                    // Keep only the SOA from the authority section — it is
+                    // what negative answers need; referral NS sets are noise.
+                    let authorities: Vec<Record> = msg
+                        .authorities
+                        .iter()
+                        .filter(|r| r.rtype() == TYPE_SOA)
+                        .cloned()
+                        .collect();
+                    self.cache.insert(
+                        key,
+                        msg.flags.rcode,
+                        msg.answers.clone(),
+                        authorities.clone(),
+                    );
+                    return Ok((msg.flags.rcode, msg.answers, authorities));
+                }
+                Role::Follower(mut rx) => {
+                    Metrics::inc(&self.metrics.singleflight_merged);
+                    // Completion signal; an error means the leader already
+                    // finished and dropped the sender. Either way: re-check.
+                    let _ = rx.wait_for(|done| *done).await;
                 }
             }
-            // Mismatched datagram (late or spoofed): keep waiting.
         }
-    })
-    .await
-    .map_err(|_| ForwardError::Timeout)?
+        // Leaders kept failing with uncacheable results; go direct.
+        let pool = self.pool.as_ref().ok_or(ForwardError::NoUpstream)?;
+        let msg = pool.query(qname, qtype, &self.metrics).await?;
+        Ok((msg.flags.rcode, msg.answers, Vec::new()))
+    }
 }
 
-async fn tcp_exchange(
-    upstream: SocketAddr,
-    wire: &[u8],
-    query: &Message,
-) -> Result<Message, ForwardError> {
-    timeout(UPSTREAM_TIMEOUT * 2, async {
-        let mut stream = TcpStream::connect(upstream).await?;
-        let mut framed = Vec::with_capacity(wire.len() + 2);
-        framed.extend_from_slice(&(wire.len() as u16).to_be_bytes());
-        framed.extend_from_slice(wire);
-        stream.write_all(&framed).await?;
-
-        let mut len_buf = [0u8; 2];
-        stream.read_exact(&mut len_buf).await?;
-        let len = u16::from_be_bytes(len_buf) as usize;
-        let mut data = vec![0u8; len];
-        stream.read_exact(&mut data).await?;
-        let m = Message::parse(&data)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad reply"))?;
-        if !is_reply_to(&m, query) {
-            return Err(ForwardError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "reply does not match query",
-            )));
-        }
-        Ok(m)
-    })
-    .await
-    .map_err(|_| ForwardError::Timeout)?
+fn find_zone<'a>(zones: &'a [Zone], name: &DnsName) -> Option<&'a Zone> {
+    zones
+        .iter()
+        .filter(|z| name.ends_with(&z.origin))
+        .max_by_key(|z| z.origin.label_count())
 }
 
-/// Unpredictable-enough query ids without a crypto dependency: an xorshift64
-/// stream seeded once from /dev/urandom.
-fn random_id() -> u16 {
-    static STATE: OnceLock<Mutex<u64>> = OnceLock::new();
-    let state = STATE.get_or_init(|| {
-        use std::io::Read;
-        let mut bytes = [0u8; 8];
-        let seed = std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(&mut bytes))
-            .map(|_| u64::from_le_bytes(bytes))
-            .unwrap_or_else(|_| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0)
-                    ^ (std::process::id() as u64) << 32
-            });
-        Mutex::new(seed | 1)
-    });
-    let mut s = state.lock().unwrap();
-    *s ^= *s << 13;
-    *s ^= *s >> 7;
-    *s ^= *s << 17;
-    (*s & 0xFFFF) as u16
+/// Fold a lookup result into a response. `append` keeps existing answers (the
+/// authoritative part of a CNAME chain) and only adds authority records when
+/// the tail produced no answers.
+fn merge(resp: &mut Message, hit: (u8, Vec<Record>, Vec<Record>), append: bool) {
+    let (rcode, mut answers, mut authorities) = hit;
+    resp.flags.rcode = rcode;
+    if append {
+        if answers.is_empty() {
+            resp.authorities.append(&mut authorities);
+        }
+        resp.answers.append(&mut answers);
+    } else {
+        resp.answers = answers;
+        resp.authorities = authorities;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dns_proto::message::{RCODE_NOERROR, RCODE_NXDOMAIN, TYPE_A};
+    use dns_proto::message::{Flags, Question, RCODE_NOERROR, RCODE_NXDOMAIN, TYPE_A};
     use dns_zone::parse_zone_file;
 
     const ZONE: &str = "\
@@ -305,8 +278,13 @@ ns1  IN A   10.0.0.1
 www  IN A   10.0.0.10
 ";
 
-    fn resolver() -> Resolver {
-        Resolver::new(vec![parse_zone_file(ZONE).unwrap()], None, 16)
+    fn resolver(upstreams: Vec<SocketAddr>) -> Resolver {
+        Resolver::new(
+            vec![parse_zone_file(ZONE).unwrap()],
+            upstreams,
+            16,
+            Arc::new(Metrics::new()),
+        )
     }
 
     fn query(name: &str, qtype: u16) -> Message {
@@ -320,9 +298,11 @@ www  IN A   10.0.0.10
     }
 
     #[tokio::test]
-    async fn authoritative_answer() {
-        let r = resolver();
-        let resp = r.handle(&query("www.example.lab", TYPE_A)).await;
+    async fn authoritative_answer_is_synchronous() {
+        let r = resolver(vec![]);
+        let Outcome::Done(resp) = r.resolve_local(&query("www.example.lab", TYPE_A), true) else {
+            panic!("zone answers must not need upstream")
+        };
         assert_eq!(resp.flags.rcode, RCODE_NOERROR);
         assert!(resp.flags.aa);
         assert!(!resp.flags.ra);
@@ -331,8 +311,8 @@ www  IN A   10.0.0.10
 
     #[tokio::test]
     async fn nxdomain_carries_soa() {
-        let r = resolver();
-        let resp = r.handle(&query("missing.example.lab", TYPE_A)).await;
+        let r = resolver(vec![]);
+        let resp = r.handle(&query("missing.example.lab", TYPE_A), true).await;
         assert_eq!(resp.flags.rcode, RCODE_NXDOMAIN);
         assert_eq!(resp.authorities.len(), 1);
         assert_eq!(resp.authorities[0].rtype(), TYPE_SOA);
@@ -340,17 +320,35 @@ www  IN A   10.0.0.10
 
     #[tokio::test]
     async fn refuses_outside_zone_without_upstream() {
-        let r = resolver();
-        let resp = r.handle(&query("google.com", TYPE_A)).await;
+        let r = resolver(vec![]);
+        let resp = r.handle(&query("google.com", TYPE_A), true).await;
         assert_eq!(resp.flags.rcode, RCODE_REFUSED);
     }
 
     #[tokio::test]
-    async fn notimp_for_weird_opcode() {
-        let r = resolver();
-        let mut q = query("www.example.lab", TYPE_A);
-        q.flags.opcode = 2; // STATUS
-        let resp = r.handle(&q).await;
-        assert_eq!(resp.flags.rcode, RCODE_NOTIMP);
+    async fn acl_denied_recursion_is_refused_but_zones_still_answer() {
+        let r = resolver(vec!["192.0.2.1:53".parse().unwrap()]);
+        let refused = r.handle(&query("google.com", TYPE_A), false).await;
+        assert_eq!(refused.flags.rcode, RCODE_REFUSED);
+        assert!(!refused.flags.ra);
+
+        let zoned = r.handle(&query("www.example.lab", TYPE_A), false).await;
+        assert_eq!(zoned.flags.rcode, RCODE_NOERROR);
+        assert_eq!(zoned.answers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn zone_hot_swap() {
+        let r = resolver(vec![]);
+        let updated = "\
+$ORIGIN example.lab.
+$TTL 300
+@    IN SOA ns1 h 2 2 3 4 300
+www  IN A   10.9.9.9
+";
+        r.set_zones(vec![parse_zone_file(updated).unwrap()]);
+        let resp = r.handle(&query("www.example.lab", TYPE_A), true).await;
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(resp.answers[0].rdata.text(), "10.9.9.9");
     }
 }

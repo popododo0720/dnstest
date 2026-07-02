@@ -1,6 +1,6 @@
 [package]
 name = "dns-resolver"
-description = "Query resolution: zones, cache, upstream forwarding"
+description = "Query resolution: zones, cache, singleflight, upstream failover"
 version.workspace = true
 edition.workspace = true
 
@@ -8,5 +8,6 @@ edition.workspace = true
 dns-proto.workspace = true
 dns-zone.workspace = true
 dns-cache.workspace = true
+dns-metrics.workspace = true
 tokio.workspace = true
 tracing.workspace = true

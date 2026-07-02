@@ -107,8 +107,8 @@ impl Cache {
         map.insert(key, entry);
     }
 
-    #[cfg(test)]
     pub fn len(&self) -> usize {
+        // Also exposed via the statistics API.
         self.inner.read().unwrap().len()
     }
 }

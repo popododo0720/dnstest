@@ -10,7 +10,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use dns_proto::message::{
     CLASS_IN, RCODE_NOERROR, RCODE_NXDOMAIN, RCODE_SERVFAIL, RData, Record, Soa, TYPE_ANY,
-    TYPE_CNAME, TYPE_SOA,
+    TYPE_CNAME, TYPE_SOA, type_code, type_name,
 };
 use dns_proto::name::DnsName;
 
@@ -32,6 +32,7 @@ fn err(line: usize, msg: impl Into<String>) -> ZoneError {
     ZoneError { line, msg: msg.into() }
 }
 
+#[derive(Clone)]
 pub struct Zone {
     pub origin: DnsName,
     pub soa: Record,
@@ -129,6 +130,182 @@ impl Zone {
     }
 }
 
+/// An owner/type group of records, the unit of the management API.
+pub struct Rrset {
+    pub name: DnsName,
+    pub rtype: u16,
+    pub ttl: u32,
+    pub contents: Vec<String>,
+}
+
+impl Zone {
+    /// Assemble and validate a zone from loose records: every owner must be
+    /// at/under the origin and exactly one SOA must be owned by the origin.
+    pub fn from_records(origin: DnsName, all: Vec<Record>) -> Result<Zone, String> {
+        let mut soa: Option<Record> = None;
+        let mut records: HashMap<DnsName, Vec<Record>> = HashMap::new();
+        let mut count = 0;
+        for r in all {
+            if !r.name.ends_with(&origin) {
+                return Err(format!("{} is outside zone {}", r.name, origin));
+            }
+            if r.rtype() == TYPE_SOA {
+                if r.name != origin {
+                    return Err("SOA owner must be the zone origin".into());
+                }
+                if soa.is_some() {
+                    return Err("duplicate SOA record".into());
+                }
+                soa = Some(r.clone());
+            }
+            records.entry(r.name.clone()).or_default().push(r);
+            count += 1;
+        }
+        let soa = soa.ok_or("zone has no SOA record")?;
+        Ok(Zone { origin, soa, record_count: count, records })
+    }
+
+    /// All rrsets, SOA first, then sorted by owner and type.
+    pub fn rrsets(&self) -> Vec<Rrset> {
+        let mut out = Vec::new();
+        for (name, rrs) in &self.records {
+            let mut types: Vec<u16> = rrs.iter().map(Record::rtype).collect();
+            types.sort_unstable();
+            types.dedup();
+            for rtype in types {
+                let members: Vec<&Record> = rrs.iter().filter(|r| r.rtype() == rtype).collect();
+                out.push(Rrset {
+                    name: name.clone(),
+                    rtype,
+                    ttl: members[0].ttl,
+                    contents: members.iter().map(|r| r.rdata.text()).collect(),
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            let a_key = (a.rtype != TYPE_SOA, a.name.to_string(), a.rtype);
+            let b_key = (b.rtype != TYPE_SOA, b.name.to_string(), b.rtype);
+            a_key.cmp(&b_key)
+        });
+        out
+    }
+
+    /// Replace (or create) the rrset for (name, rtype) with the given
+    /// contents, PowerDNS `changetype: REPLACE` semantics.
+    pub fn replace_rrset(
+        &mut self,
+        name: &DnsName,
+        rtype: &str,
+        ttl: u32,
+        contents: &[String],
+    ) -> Result<(), String> {
+        let code = type_code(rtype).ok_or_else(|| format!("unsupported type '{rtype}'"))?;
+        if !name.ends_with(&self.origin) {
+            return Err(format!("{name} is outside zone {}", self.origin));
+        }
+        if contents.is_empty() {
+            return Err("empty contents; use changetype DELETE to remove an rrset".into());
+        }
+        let mut new_records = Vec::with_capacity(contents.len());
+        for content in contents {
+            let rdata = rdata_from_text(rtype, content, &self.origin)?;
+            new_records.push(Record { name: name.clone(), class: CLASS_IN, ttl, rdata });
+        }
+
+        if code == TYPE_SOA {
+            if *name != self.origin {
+                return Err("SOA owner must be the zone origin".into());
+            }
+            if new_records.len() != 1 {
+                return Err("SOA rrset must contain exactly one record".into());
+            }
+            self.soa = new_records[0].clone();
+        }
+        // RFC 1034 §3.6.2: CNAME cannot coexist with other data.
+        let node = self.records.entry(name.clone()).or_default();
+        let node_has_other = node.iter().any(|r| r.rtype() != code);
+        if code == TYPE_CNAME && node_has_other {
+            return Err(format!("{name} already has non-CNAME records"));
+        }
+        if code != TYPE_CNAME && node.iter().any(|r| r.rtype() == TYPE_CNAME) {
+            return Err(format!("{name} is a CNAME; delete it first"));
+        }
+        if new_records.len() > 1 && code == TYPE_CNAME {
+            return Err("CNAME rrset must contain exactly one record".into());
+        }
+
+        node.retain(|r| r.rtype() != code);
+        node.extend(new_records);
+        self.recount();
+        Ok(())
+    }
+
+    /// Remove the rrset for (name, rtype), PowerDNS `changetype: DELETE`.
+    pub fn delete_rrset(&mut self, name: &DnsName, rtype: &str) -> Result<(), String> {
+        let code = type_code(rtype).ok_or_else(|| format!("unsupported type '{rtype}'"))?;
+        if code == TYPE_SOA {
+            return Err("cannot delete the SOA; delete the zone instead".into());
+        }
+        if let Some(node) = self.records.get_mut(name) {
+            node.retain(|r| r.rtype() != code);
+            if node.is_empty() {
+                self.records.remove(name);
+            }
+        }
+        self.recount();
+        Ok(())
+    }
+
+    /// Bump the SOA serial so secondaries and caches see the change.
+    pub fn bump_serial(&mut self) {
+        let RData::Soa(soa) = &mut self.soa.rdata else { return };
+        soa.serial = soa.serial.wrapping_add(1);
+        let origin = self.origin.clone();
+        let fresh = self.soa.clone();
+        if let Some(node) = self.records.get_mut(&origin) {
+            for r in node.iter_mut().filter(|r| r.rtype() == TYPE_SOA) {
+                *r = fresh.clone();
+            }
+        }
+    }
+
+    fn recount(&mut self) {
+        self.record_count = self.records.values().map(Vec::len).sum();
+    }
+
+    /// Serialize back to master-file format (round-trips through
+    /// [`parse_zone_file`]).
+    pub fn to_zonefile(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(1024);
+        let _ = writeln!(out, "; generated by rdns");
+        let _ = writeln!(out, "$ORIGIN {}", self.origin);
+        for rrset in self.rrsets() {
+            for content in &rrset.contents {
+                let _ = writeln!(
+                    out,
+                    "{} {} IN {} {}",
+                    rrset.name,
+                    rrset.ttl,
+                    type_name(rrset.rtype),
+                    content
+                );
+            }
+        }
+        out
+    }
+}
+
+/// Parse rdata from its textual content, e.g. `("MX", "10 mail.example.com.")`.
+pub fn rdata_from_text(rtype: &str, text: &str, origin: &DnsName) -> Result<RData, String> {
+    let mut depth = 0;
+    let toks = tokenize_line(text, &mut depth, 0).map_err(|e| e.msg)?;
+    if depth != 0 {
+        return Err("unbalanced parentheses".into());
+    }
+    parse_rdata(&rtype.to_ascii_uppercase(), &toks, origin, 0).map_err(|e| e.msg)
+}
+
 /// Parse a zone file. The file must contain a `$ORIGIN` directive and exactly
 /// one SOA record owned by the origin.
 pub fn parse_zone_file(text: &str) -> Result<Zone, ZoneError> {
@@ -192,29 +369,8 @@ pub fn parse_zone_file(text: &str) -> Result<Zone, ZoneError> {
     }
 
     let origin = origin.ok_or_else(|| err(0, "zone file has no $ORIGIN directive"))?;
-
-    let mut soa: Option<Record> = None;
-    let mut records: HashMap<DnsName, Vec<Record>> = HashMap::new();
-    let mut count = 0;
-    for (line_no, r) in all {
-        if !r.name.ends_with(&origin) {
-            return Err(err(line_no, format!("{} is outside zone {}", r.name, origin)));
-        }
-        if r.rtype() == TYPE_SOA {
-            if r.name != origin {
-                return Err(err(line_no, "SOA owner must be the zone origin"));
-            }
-            if soa.is_some() {
-                return Err(err(line_no, "duplicate SOA record"));
-            }
-            soa = Some(r.clone());
-        }
-        records.entry(r.name.clone()).or_default().push(r);
-        count += 1;
-    }
-    let soa = soa.ok_or_else(|| err(0, "zone has no SOA record"))?;
-
-    Ok(Zone { origin, soa, record_count: count, records })
+    Zone::from_records(origin, all.into_iter().map(|(_, r)| r).collect())
+        .map_err(|msg| err(0, msg))
 }
 
 fn resolve_name(token: &str, origin: &DnsName, line_no: usize) -> Result<DnsName, ZoneError> {

@@ -1,0 +1,7 @@
+[package]
+name = "dns-guard"
+description = "Client ACLs (CIDR) and per-client token-bucket rate limiting"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

@@ -60,6 +60,22 @@ pub fn type_name(t: u16) -> String {
     }
 }
 
+/// Inverse of [`type_name`] for the types this server understands.
+pub fn type_code(s: &str) -> Option<u16> {
+    match s.to_ascii_uppercase().as_str() {
+        "A" => Some(TYPE_A),
+        "NS" => Some(TYPE_NS),
+        "CNAME" => Some(TYPE_CNAME),
+        "SOA" => Some(TYPE_SOA),
+        "PTR" => Some(TYPE_PTR),
+        "MX" => Some(TYPE_MX),
+        "TXT" => Some(TYPE_TXT),
+        "AAAA" => Some(TYPE_AAAA),
+        "SRV" => Some(TYPE_SRV),
+        _ => None,
+    }
+}
+
 pub const RCODE_NOERROR: u8 = 0;
 pub const RCODE_FORMERR: u8 = 1;
 pub const RCODE_SERVFAIL: u8 = 2;
@@ -166,6 +182,34 @@ impl RData {
             RData::Txt(_) => TYPE_TXT,
             RData::Srv { .. } => TYPE_SRV,
             RData::Unknown { rtype, .. } => *rtype,
+        }
+    }
+
+    /// Master-file / API content representation ("10 mail.example.com.",
+    /// "\"txt string\"", ...). Inverse of zone-file rdata parsing.
+    pub fn text(&self) -> String {
+        match self {
+            RData::A(ip) => ip.to_string(),
+            RData::Aaaa(ip) => ip.to_string(),
+            RData::Ns(n) | RData::Cname(n) | RData::Ptr(n) => n.to_string(),
+            RData::Soa(s) => format!(
+                "{} {} {} {} {} {} {}",
+                s.mname, s.rname, s.serial, s.refresh, s.retry, s.expire, s.minimum
+            ),
+            RData::Mx { preference, exchange } => format!("{preference} {exchange}"),
+            RData::Txt(strings) => strings
+                .iter()
+                .map(|s| format!("\"{}\"", String::from_utf8_lossy(s).replace('"', "\\\"")))
+                .collect::<Vec<_>>()
+                .join(" "),
+            RData::Srv { priority, weight, port, target } => {
+                format!("{priority} {weight} {port} {target}")
+            }
+            // RFC 3597 generic encoding.
+            RData::Unknown { data, .. } => {
+                let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
+                format!("\\# {} {hex}", data.len())
+            }
         }
     }
 
