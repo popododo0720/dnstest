@@ -36,6 +36,31 @@ Changes take effect immediately (the SOA serial is bumped automatically), are
 persisted to `zone_dir` as zone files, notify configured secondaries, and
 re-sign the zone when DNSSEC is enabled.
 
+## Resolution modes
+
+`recursion.mode = "forward"` (default) sends cache misses to the configured
+upstreams with failover. `recursion.mode = "recursive"` instead resolves
+iteratively from the IANA root hints, following NS referrals and glue down the
+delegation tree with no upstream — a full recursive resolver. Both modes share
+the cache, singleflight, RPZ, and DNSSEC validation. Conditional forwarding
+(`[[forward]]`) overrides the mode for specific zones.
+
+## Record types
+
+The typed rdata parsers cover A, AAAA, NS, CNAME, SOA, PTR, MX, TXT, SRV, and
+CAA. Any other type — TLSA, SVCB, HTTPS, NAPTR, DS, DNSKEY, … — is authorable in
+zone files and over the API using the RFC 3597 generic form
+(`name TTL IN TYPE52 \# <len> <hex>`), and all types forward and cache
+transparently.
+
+## Dynamic updates (RFC 2136)
+
+`[update] allow` enables `nsupdate`-style dynamic updates over UDP and TCP:
+record additions and deletions, prerequisite checks, gated by a client ACL and
+optional TSIG. A successful update bumps the SOA serial, journals the delta for
+IXFR, persists the zone, re-signs it when DNSSEC is enabled, and NOTIFYs
+secondaries.
+
 ## Zone transfers and secondaries
 
 - **Primary**: serves AXFR (gated by `transfer.allow`) and IXFR (incremental,
@@ -83,13 +108,15 @@ RSA, ECDSA, and Ed25519, for positive answers, DNSKEY, and NSEC/NSEC3 denial.
 
 ### Validating resolver
 
-Setting `recursion.validate = true` validates forwarded answers against the
-DNSSEC chain of trust from the IANA root trust anchor. Each rrset is checked
-against its own signer's keys (so cross-zone CNAME chains validate correctly),
-and negative answers are authenticated through their NSEC/NSEC3 records,
-including range coverage and closest-encloser proofs. Securely-validated answers
-set the AD bit — preserved across cache hits — while forged or broken chains
-return SERVFAIL and unsigned zones pass through unauthenticated.
+Setting `recursion.validate = true` validates answers against the DNSSEC chain
+of trust from the IANA root trust anchor, in both forward and recursive mode.
+Each rrset is checked against its own signer's keys (so cross-zone CNAME chains
+validate correctly); negative answers are authenticated through their NSEC/NSEC3
+records including range coverage and closest-encloser proofs; and insecure
+delegations are only accepted when the absence of a DS is itself proven by the
+parent's NSEC/NSEC3 (including opt-out), closing the downgrade gap. Securely-
+validated answers set the AD bit — preserved across cache hits — while forged or
+broken chains return SERVFAIL and provably-unsigned zones pass through.
 
 Verified against the live internet: valid signatures (ECDSA and RSA, including
 1024-bit ZSKs) set AD on both positive and NXDOMAIN/NODATA answers, while
@@ -130,8 +157,8 @@ crates/
   dns-dnssec    DNSSEC signing and validation: DNSKEY/RRSIG/NSEC/NSEC3/DS
   dns-tls       DoT/DoH TLS setup and DoH codec
   dns-xfr       AXFR/IXFR in and out, NOTIFY, journal, secondary refresh
-  dns-resolver  resolution (zones → cache → upstream), singleflight, failover, RPZ, DNSSEC validation
-  rdns          binary: UDP/TCP/DoT/DoH listeners, management API, config
+  dns-resolver  resolution (zones → cache → upstream/recursive), singleflight, RPZ, DNSSEC validation
+  rdns          binary: UDP/TCP/DoT/DoH listeners, management API, dynamic updates, config
 ```
 
-Tests: `cargo test` (60).
+Tests: `cargo test` (74).

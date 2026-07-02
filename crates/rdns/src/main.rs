@@ -187,7 +187,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let metrics = Arc::new(Metrics::new());
     let zones = load_zones(&cfg.zones, cfg.zone_dir.as_deref())?;
-    let upstreams = if cfg.recursion.enabled { cfg.recursion.upstreams.clone() } else { vec![] };
+    let recursive = cfg.recursion.enabled
+        && cfg.recursion.mode.eq_ignore_ascii_case("recursive");
+    let upstreams = if cfg.recursion.enabled && !recursive {
+        cfg.recursion.upstreams.clone()
+    } else {
+        vec![]
+    };
     let acl = Acl::parse(&cfg.recursion.allow)?;
     let transfer_acl = Acl::parse(&cfg.transfer.allow)?;
     let limiter = (cfg.rate_limit.qps > 0)
@@ -219,6 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rpz,
             signed: Default::default(),
             validate: cfg.recursion.validate,
+            recursive,
         },
         metrics.clone(),
     ));
@@ -300,6 +307,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|n| DnsName::parse_str(n).map_err(|e| format!("transfer.require_tsig: {e}")))
         .transpose()?;
 
+    // RFC 2136 dynamic updates: enabled when an allow-list is configured.
+    let updates = if cfg.update.allow.is_empty() {
+        None
+    } else {
+        let require_update_tsig = cfg
+            .update
+            .require_tsig
+            .as_ref()
+            .map(|n| DnsName::parse_str(n).map_err(|e| format!("update.require_tsig: {e}")))
+            .transpose()?;
+        info!("dynamic updates (RFC 2136) enabled for {:?}", cfg.update.allow);
+        Some(server::UpdateCtx {
+            acl: Acl::parse(&cfg.update.allow)?,
+            require_tsig: require_update_tsig,
+            zone_dir: cfg.zone_dir.clone(),
+            notify_targets: cfg.transfer.notify.clone(),
+            dnssec: dnssec.as_ref().map(|(k, o)| (k.clone(), o.clone(), validity, nsec3.clone())),
+        })
+    };
+
     let ctx = Arc::new(server::ServerCtx {
         resolver: resolver.clone(),
         metrics: metrics.clone(),
@@ -311,6 +338,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         journal: journal.clone(),
         tsig_keys: keyring,
         require_tsig,
+        updates,
     });
 
     let workers = if cfg.workers == 0 {

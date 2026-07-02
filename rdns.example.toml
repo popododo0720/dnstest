@@ -9,9 +9,10 @@ query_log = true       # per-query info logs; turn off under load
 
 [recursion]
 enabled = true
-upstreams = ["1.1.1.1:53", "8.8.8.8:53"]   # failover order
+mode = "forward"       # "forward" (use upstreams) or "recursive" (iterate from root)
+upstreams = ["1.1.1.1:53", "8.8.8.8:53"]   # failover order (forward mode)
 allow = ["127.0.0.0/8", "10.0.0.0/8", "192.168.0.0/16", "::1/128"]
-validate = false       # true = DNSSEC-validate forwarded answers (root anchor)
+validate = false       # true = DNSSEC-validate answers against the root anchor
 
 [cache]
 max_entries = 100000
@@ -69,3 +70,8 @@ notify = []                    # secondaries to NOTIFY on zone change
 # self_signed_names = ["dns.example.lab"]
 # dot_listen = "0.0.0.0:853"
 # doh_listen = "0.0.0.0:443"       # HTTP/2 (ALPN h2) + HTTP/1.1
+
+# --- Dynamic updates (RFC 2136 / nsupdate) ---
+[update]
+# allow = ["127.0.0.0/8"]        # client networks; empty = disabled
+# require_tsig = "xfrkey."        # require this TSIG key on updates

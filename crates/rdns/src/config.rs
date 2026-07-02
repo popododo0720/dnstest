@@ -39,6 +39,8 @@ pub struct Config {
     pub dnssec: DnssecCfg,
     /// DNS-over-TLS / DNS-over-HTTPS; absent = disabled.
     pub tls: Option<TlsCfg>,
+    /// RFC 2136 dynamic updates.
+    pub update: UpdateCfg,
 }
 
 impl Default for Config {
@@ -61,8 +63,18 @@ impl Default for Config {
             tsig_keys: Vec::new(),
             dnssec: DnssecCfg::default(),
             tls: None,
+            update: UpdateCfg::default(),
         }
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateCfg {
+    /// Networks allowed to send RFC 2136 updates; empty = updates disabled.
+    pub allow: Vec<String>,
+    /// Require this TSIG key name on updates (empty = IP ACL only).
+    pub require_tsig: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -179,19 +191,27 @@ pub struct RpzCfg {
 #[serde(default, deny_unknown_fields)]
 pub struct Recursion {
     pub enabled: bool,
+    /// "forward" (send to `upstreams`) or "recursive" (iterate from the root).
+    #[serde(default = "default_recursion_mode")]
+    pub mode: String,
     /// Tried in order; the first healthy upstream becomes preferred.
     pub upstreams: Vec<SocketAddr>,
     /// Client networks allowed to use recursion (open-resolver protection).
     pub allow: Vec<String>,
-    /// Validate forwarded answers against the DNSSEC root trust anchor.
+    /// Validate answers against the DNSSEC root trust anchor.
     #[serde(default)]
     pub validate: bool,
+}
+
+fn default_recursion_mode() -> String {
+    "forward".into()
 }
 
 impl Default for Recursion {
     fn default() -> Self {
         Recursion {
             enabled: true,
+            mode: default_recursion_mode(),
             upstreams: vec!["1.1.1.1:53".parse().unwrap(), "8.8.8.8:53".parse().unwrap()],
             allow: vec!["127.0.0.0/8".into(), "::1/128".into()],
             validate: false,

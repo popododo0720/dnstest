@@ -52,10 +52,28 @@ pub struct ServerCtx {
     pub secondaries: HashMap<DnsName, Arc<Secondary>>,
     /// Change history for incremental (IXFR) transfers.
     pub journal: Arc<Journal>,
-    /// TSIG keys accepted on transfers.
+    /// TSIG keys accepted on transfers and updates.
     pub tsig_keys: KeyRing,
     /// When set, AXFR/IXFR must carry a valid TSIG signed by this key.
     pub require_tsig: Option<DnsName>,
+    /// Everything needed to accept and commit RFC 2136 dynamic updates.
+    pub updates: Option<UpdateCtx>,
+}
+
+/// Configuration for dynamic updates (RFC 2136), shared with zone persistence.
+pub struct UpdateCtx {
+    pub acl: Acl,
+    /// Require a valid TSIG by this key name (None = IP ACL only).
+    pub require_tsig: Option<DnsName>,
+    pub zone_dir: Option<std::path::PathBuf>,
+    pub notify_targets: Vec<SocketAddr>,
+    /// DNSSEC signers + origins + validity + NSEC3 for re-signing after edits.
+    pub dnssec: Option<(
+        Arc<Vec<dns_dnssec::DnssecKey>>,
+        Vec<DnsName>,
+        u64,
+        Option<dns_dnssec::nsec3::Nsec3Params>,
+    )>,
 }
 
 /// N kernel-load-balanced sockets bound to the same address.
@@ -115,6 +133,13 @@ pub async fn run_udp_worker(socket: UdpSocket, ctx: Arc<ServerCtx>) -> std::io::
             continue;
         }
 
+        // RFC 2136 dynamic update.
+        if query.flags.opcode == dns_proto::message::OPCODE_UPDATE {
+            let resp = handle_update(&ctx, peer, &query, &buf[..n]).await;
+            let _ = socket.send_to(&resp.encode(), peer).await;
+            continue;
+        }
+
         let allowed = ctx.acl.is_allowed(peer.ip());
         match ctx.resolver.resolve_local(&query, allowed) {
             // Fast path: answered from zones/cache, sent inline.
@@ -134,14 +159,34 @@ pub async fn run_udp_worker(socket: UdpSocket, ctx: Arc<ServerCtx>) -> std::io::
     }
 }
 
+/// DNSSEC records (RRSIG/NSEC/NSEC3/DNSKEY/DS) are only sent to clients that
+/// requested them with the DO bit (RFC 3225). Recursion/validation fetches
+/// them regardless, so strip them for non-DO clients.
+fn strip_dnssec_unless_do(resp: &mut Message, query: &Message) {
+    use dns_proto::message::{TYPE_DNSKEY, TYPE_DS, TYPE_NSEC, TYPE_NSEC3, TYPE_NSEC3PARAM, TYPE_RRSIG};
+    let do_bit = query.edns.as_ref().is_some_and(|e| e.do_bit);
+    if do_bit {
+        return;
+    }
+    let is_dnssec = |t: u16| {
+        matches!(t, TYPE_RRSIG | TYPE_NSEC | TYPE_NSEC3 | TYPE_NSEC3PARAM | TYPE_DNSKEY | TYPE_DS)
+    };
+    // Keep DNSKEY/DS when explicitly queried; otherwise these are meta records.
+    let qtype = query.questions.first().map(|q| q.qtype);
+    resp.answers.retain(|r| !is_dnssec(r.rtype()) || Some(r.rtype()) == qtype);
+    resp.authorities.retain(|r| !is_dnssec(r.rtype()));
+    resp.additionals.retain(|r| !is_dnssec(r.rtype()));
+}
+
 async fn finish_udp(
     ctx: &ServerCtx,
     socket: &UdpSocket,
     peer: SocketAddr,
     query: &Message,
-    resp: Message,
+    mut resp: Message,
     started: Instant,
 ) {
+    strip_dnssec_unless_do(&mut resp, query);
     // Without EDNS the classic 512-byte limit applies (RFC 1035); with it,
     // the client's advertised size, kept within reason.
     let limit = query
@@ -377,13 +422,20 @@ pub async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        // Zone transfers stream multiple framed messages directly.
+        // Zone transfers and dynamic updates are handled specially.
         if let Ok(query) = Message::parse(&data) {
             if is_transfer(&query) {
                 let frames = transfer_out(&ctx, peer, &query, &data);
                 for frame in frames {
                     stream.write_all(&frame).await?;
                 }
+                continue;
+            }
+            if query.flags.opcode == dns_proto::message::OPCODE_UPDATE {
+                let resp = handle_update(&ctx, peer, &query, &data).await;
+                let wire = resp.encode();
+                stream.write_all(&(wire.len() as u16).to_be_bytes()).await?;
+                stream.write_all(&wire).await?;
                 continue;
             }
         }
@@ -409,7 +461,8 @@ pub async fn handle_query_bytes(
     match Message::parse(data) {
         Ok(query) => {
             let allowed = ctx.acl.is_allowed(peer.ip());
-            let resp = ctx.resolver.handle(&query, allowed).await;
+            let mut resp = ctx.resolver.handle(&query, allowed).await;
+            strip_dnssec_unless_do(&mut resp, &query);
             observe(ctx, proto, peer, &query, &resp, started);
             // DoT/DoH have no 512-byte limit; TCP framing carries the rest.
             resp.encode_limited(u16::MAX as usize)
@@ -543,6 +596,92 @@ fn frame_one(wire: &[u8]) -> Vec<Vec<u8>> {
     framed.extend_from_slice(&(wire.len() as u16).to_be_bytes());
     framed.extend_from_slice(wire);
     vec![framed]
+}
+
+/// Handle an RFC 2136 dynamic update: ACL + TSIG gate, apply to the zone, then
+/// persist / re-sign / NOTIFY on success.
+async fn handle_update(
+    ctx: &ServerCtx,
+    peer: SocketAddr,
+    query: &Message,
+    raw: &[u8],
+) -> Message {
+    use dns_proto::message::{OPCODE_UPDATE, RCODE_NOERROR, RCODE_NOTAUTH, RCODE_REFUSED};
+
+    let mut resp = Message::response_to(query);
+    resp.flags.opcode = OPCODE_UPDATE;
+
+    let Some(up) = &ctx.updates else {
+        resp.flags.rcode = RCODE_REFUSED; // updates disabled
+        return resp;
+    };
+    if !up.acl.is_allowed(peer.ip()) {
+        resp.flags.rcode = RCODE_REFUSED;
+        return resp;
+    }
+    // TSIG: required when configured, otherwise verified if present.
+    if up.require_tsig.is_some() || query.tsig.is_some() {
+        match tsig_verify(query, raw, &ctx.tsig_keys, unix_now(), None) {
+            Ok(_) => {
+                if let Some(req) = &up.require_tsig {
+                    if query.tsig.as_ref().map(|t| &t.key_name) != Some(req) {
+                        resp.flags.rcode = RCODE_NOTAUTH;
+                        return resp;
+                    }
+                }
+            }
+            Err(_) => {
+                resp.flags.rcode = RCODE_NOTAUTH;
+                return resp;
+            }
+        }
+    }
+
+    // RFC 2136: the Zone section is the single question (type SOA).
+    let Some(zone_q) = query.questions.first() else {
+        resp.flags.rcode = dns_proto::message::RCODE_FORMERR;
+        return resp;
+    };
+    let zones = ctx.resolver.zones();
+    let Some(old) = zones.iter().find(|z| z.origin == zone_q.qname) else {
+        resp.flags.rcode = RCODE_NOTAUTH; // not authoritative for this zone
+        return resp;
+    };
+
+    let mut new_zone = old.clone();
+    let rcode = new_zone.apply_update(&query.answers, &query.authorities);
+    if rcode != RCODE_NOERROR {
+        resp.flags.rcode = rcode;
+        return resp;
+    }
+    new_zone.bump_serial();
+
+    // Commit: swap the zone in, journal the delta, persist, re-sign, notify.
+    ctx.journal.record(old, &new_zone);
+    let origin = new_zone.origin.clone();
+    ctx.resolver.upsert_zone(new_zone.clone());
+    Metrics::inc(&ctx.metrics.zone_reloads);
+
+    if let Some(dir) = &up.zone_dir {
+        let stem = origin.to_string();
+        let path = dir.join(format!("{}.zone", stem.trim_end_matches('.')));
+        if let Err(e) = std::fs::write(&path, new_zone.to_zonefile()) {
+            debug!("update: cannot persist {}: {e}", path.display());
+        }
+    }
+    if let Some((keys, origins, validity, nsec3)) = &up.dnssec {
+        if origins.contains(&origin) {
+            ctx.resolver.resign(keys, origins, unix_now(), *validity, nsec3.clone());
+        }
+    }
+    for &target in &up.notify_targets {
+        let origin = origin.clone();
+        tokio::spawn(async move {
+            let _ = dns_xfr::send_notify(target, &origin).await;
+        });
+    }
+    info!("update: {peer} modified zone {origin} -> serial bumped");
+    resp
 }
 
 /// Echo the id back with FORMERR if there is enough to salvage one.

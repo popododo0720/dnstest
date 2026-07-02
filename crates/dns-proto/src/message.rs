@@ -30,10 +30,16 @@ impl std::error::Error for WireError {}
 
 pub const CLASS_IN: u16 = 1;
 pub const CLASS_CH: u16 = 3;
+pub const CLASS_NONE: u16 = 254;
 pub const CLASS_ANY: u16 = 255;
 
 pub const OPCODE_QUERY: u8 = 0;
 pub const OPCODE_NOTIFY: u8 = 4;
+pub const OPCODE_UPDATE: u8 = 5;
+
+pub const RCODE_YXDOMAIN: u8 = 6;
+pub const RCODE_YXRRSET: u8 = 7;
+pub const RCODE_NXRRSET: u8 = 8;
 
 pub const TYPE_A: u16 = 1;
 pub const TYPE_NS: u16 = 2;
@@ -80,6 +86,11 @@ pub fn type_name(t: u16) -> String {
         TYPE_DNSKEY => "DNSKEY".into(),
         TYPE_NSEC3 => "NSEC3".into(),
         TYPE_NSEC3PARAM => "NSEC3PARAM".into(),
+        TYPE_NAPTR => "NAPTR".into(),
+        TYPE_TLSA => "TLSA".into(),
+        TYPE_SVCB => "SVCB".into(),
+        TYPE_HTTPS => "HTTPS".into(),
+        TYPE_CAA => "CAA".into(),
         TYPE_IXFR => "IXFR".into(),
         TYPE_AXFR => "AXFR".into(),
         TYPE_TSIG => "TSIG".into(),
@@ -89,19 +100,39 @@ pub fn type_name(t: u16) -> String {
 }
 
 /// Inverse of [`type_name`] for the types this server understands.
+pub const TYPE_NAPTR: u16 = 35;
+pub const TYPE_TLSA: u16 = 52;
+pub const TYPE_SVCB: u16 = 64;
+pub const TYPE_HTTPS: u16 = 65;
+pub const TYPE_CAA: u16 = 257;
+
 pub fn type_code(s: &str) -> Option<u16> {
-    match s.to_ascii_uppercase().as_str() {
-        "A" => Some(TYPE_A),
-        "NS" => Some(TYPE_NS),
-        "CNAME" => Some(TYPE_CNAME),
-        "SOA" => Some(TYPE_SOA),
-        "PTR" => Some(TYPE_PTR),
-        "MX" => Some(TYPE_MX),
-        "TXT" => Some(TYPE_TXT),
-        "AAAA" => Some(TYPE_AAAA),
-        "SRV" => Some(TYPE_SRV),
-        _ => None,
-    }
+    let up = s.to_ascii_uppercase();
+    let known = match up.as_str() {
+        "A" => TYPE_A,
+        "NS" => TYPE_NS,
+        "CNAME" => TYPE_CNAME,
+        "SOA" => TYPE_SOA,
+        "PTR" => TYPE_PTR,
+        "MX" => TYPE_MX,
+        "TXT" => TYPE_TXT,
+        "AAAA" => TYPE_AAAA,
+        "SRV" => TYPE_SRV,
+        "NAPTR" => TYPE_NAPTR,
+        "TLSA" => TYPE_TLSA,
+        "SVCB" => TYPE_SVCB,
+        "HTTPS" => TYPE_HTTPS,
+        "CAA" => TYPE_CAA,
+        "DS" => TYPE_DS,
+        "DNSKEY" => TYPE_DNSKEY,
+        "NSEC" => TYPE_NSEC,
+        "NSEC3" => TYPE_NSEC3,
+        "NSEC3PARAM" => TYPE_NSEC3PARAM,
+        "RRSIG" => TYPE_RRSIG,
+        // RFC 3597 generic form: TYPEnnnn.
+        other => return other.strip_prefix("TYPE").and_then(|n| n.parse().ok()),
+    };
+    Some(known)
 }
 
 pub const RCODE_NOERROR: u8 = 0;
@@ -245,6 +276,12 @@ impl RData {
         let end = pos.checked_add(rdlen).ok_or(WireError::Truncated)?;
         if end > buf.len() {
             return Err(WireError::Truncated);
+        }
+        // Empty rdata: a typed reader would over-read into the next record.
+        // This is normal in RFC 2136 updates (delete-rrset carries type but
+        // zero rdata), so keep the type and an empty payload.
+        if rdlen == 0 {
+            return Ok(RData::Unknown { rtype, data: Vec::new() });
         }
         let rdata = match rtype {
             TYPE_A => {
@@ -816,5 +853,156 @@ mod tests {
         // Header claiming one question but no question bytes.
         let hdr = [0u8, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
         assert!(Message::parse(&hdr).is_err());
+    }
+
+    /// Deterministic xorshift PRNG so fuzz tests are reproducible.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn byte(&mut self) -> u8 {
+            (self.next() & 0xFF) as u8
+        }
+    }
+
+    #[test]
+    fn parser_never_panics_on_random_input() {
+        // A DNS server must never crash on hostile input. Feed 200k random
+        // buffers of assorted lengths; the only requirement is no panic.
+        let mut rng = Rng(0x1234_5678_9abc_def0);
+        for _ in 0..200_000 {
+            let len = (rng.next() % 300) as usize;
+            let buf: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+            let _ = Message::parse(&buf); // Ok or Err, never a panic
+        }
+    }
+
+    #[test]
+    fn parser_never_panics_on_mutated_valid_messages() {
+        // Start from a real message and flip random bytes — catches parsers
+        // that trust internal length/offset fields.
+        let base = sample_response().encode();
+        let mut rng = Rng(0xdead_beef_cafe_babe);
+        for _ in 0..100_000 {
+            let mut buf = base.clone();
+            let flips = 1 + (rng.next() % 8) as usize;
+            for _ in 0..flips {
+                let idx = (rng.next() as usize) % buf.len();
+                buf[idx] ^= rng.byte();
+            }
+            let _ = Message::parse(&buf);
+        }
+    }
+
+    #[test]
+    fn every_truncation_of_a_valid_message_is_safe() {
+        // Parsing any prefix of a valid message must return Err, not panic.
+        let full = sample_response().encode();
+        for n in 0..full.len() {
+            let _ = Message::parse(&full[..n]);
+        }
+        // The full message still round-trips.
+        assert!(Message::parse(&full).is_ok());
+    }
+
+    #[test]
+    fn compression_pointer_fuzz_terminates() {
+        // Random pointer-laden buffers must never loop forever or panic.
+        let mut rng = Rng(0x0f0f_0f0f_0f0f_0f0f);
+        for _ in 0..50_000 {
+            let len = 2 + (rng.next() % 40) as usize;
+            let mut buf: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+            // Bias toward compression pointers (0xC0..) to stress the chaser.
+            for b in buf.iter_mut() {
+                if rng.next() % 3 == 0 {
+                    *b |= 0xC0;
+                }
+            }
+            let mut pos = 0;
+            let _ = DnsName::from_wire(&buf, &mut pos);
+        }
+    }
+
+    #[test]
+    fn all_supported_rtypes_roundtrip() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        let n = |s| DnsName::parse_str(s).unwrap();
+        let rdatas = vec![
+            RData::A(Ipv4Addr::new(1, 2, 3, 4)),
+            RData::Aaaa(Ipv6Addr::LOCALHOST),
+            RData::Ns(n("ns.example.com")),
+            RData::Cname(n("c.example.com")),
+            RData::Ptr(n("p.example.com")),
+            RData::Mx { preference: 65535, exchange: n("mx.example.com") },
+            RData::Txt(vec![vec![], b"a".to_vec(), vec![0xFF; 255]]),
+            RData::Srv { priority: 1, weight: 2, port: 3, target: n("t.example.com") },
+            RData::Soa(Soa {
+                mname: n("ns.example.com"),
+                rname: n("h.example.com"),
+                serial: u32::MAX,
+                refresh: 1,
+                retry: 2,
+                expire: 3,
+                minimum: 4,
+            }),
+            RData::Unknown { rtype: 99, data: vec![1, 2, 3, 4, 5] },
+        ];
+        for rd in rdatas {
+            let mut m = Message::new(1, Flags::default());
+            m.answers.push(Record { name: n("owner.example.com"), class: CLASS_IN, ttl: 7, rdata: rd.clone() });
+            let back = Message::parse(&m.encode()).unwrap();
+            assert_eq!(back.answers[0].rdata, rd, "roundtrip failed for {rd:?}");
+        }
+    }
+
+    #[test]
+    fn counts_larger_than_body_are_rejected_not_oom() {
+        // Header claims 65535 of everything but the body is empty. Must Err
+        // quickly, not allocate on the claimed counts.
+        let mut hdr = vec![0u8, 0];
+        hdr.extend_from_slice(&[0, 0]); // flags
+        hdr.extend_from_slice(&0xFFFFu16.to_be_bytes()); // qdcount
+        hdr.extend_from_slice(&0xFFFFu16.to_be_bytes()); // ancount
+        hdr.extend_from_slice(&0xFFFFu16.to_be_bytes()); // nscount
+        hdr.extend_from_slice(&0xFFFFu16.to_be_bytes()); // arcount
+        assert!(Message::parse(&hdr).is_err());
+    }
+
+    #[test]
+    fn tsig_survives_roundtrip_within_message() {
+        let mut m = Message::new(0x9999, Flags { qr: true, ..Flags::default() });
+        m.questions.push(Question { qname: name("a.b"), qtype: TYPE_A, qclass: CLASS_IN });
+        let tsig = Tsig {
+            key_name: name("key.name"),
+            algorithm: name("hmac-sha256"),
+            time_signed: 0x0000_1122_3344_5566, // 48-bit
+            fudge: 300,
+            mac: vec![0xAB; 32],
+            original_id: 0x9999,
+            error: 0,
+            other: vec![],
+        };
+        let wire = m.encode_with_tsig(&tsig);
+        let back = Message::parse(&wire).unwrap();
+        assert_eq!(back.tsig.as_ref().unwrap().time_signed, tsig.time_signed);
+        assert_eq!(back.tsig.as_ref().unwrap().mac, tsig.mac);
+        assert!(back.tsig_start.is_some());
+    }
+
+    #[test]
+    fn flags_roundtrip_all_bits() {
+        // The Z bit (0x0040) is reserved and not modeled; every other bit
+        // survives a decode/encode cycle.
+        const MODELED: u16 = !0x0040;
+        for v in [0u16, 0xFFFF, 0x8180, 0x0100, 0x2400] {
+            assert_eq!(Flags::from_u16(v).to_u16(), v & MODELED);
+        }
+        // Every individual field survives the pack/unpack cycle.
+        let f = Flags { qr: true, opcode: 5, aa: true, tc: true, rd: true, ra: true, ad: true, cd: true, rcode: 9 };
+        assert_eq!(Flags::from_u16(f.to_u16()), f);
     }
 }

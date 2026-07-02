@@ -8,10 +8,12 @@
 //! asynchronous [`Resolver::resolve_pending`].
 
 mod flight;
+mod recursor;
 mod rpz;
 mod upstream;
 mod validator;
 
+pub use recursor::Recursor;
 pub use rpz::{Rpz, RpzAction};
 pub use upstream::ForwardError;
 pub use validator::{Security, TrustAnchor, Validator};
@@ -45,6 +47,8 @@ pub struct Resolver {
     signed: RwLock<Arc<HashMap<DnsName, Arc<SignedZone>>>>,
     /// Validating-resolver engine (set when DNSSEC validation is enabled).
     validator: Option<Validator>,
+    /// Iterative recursive resolver (set in recursive mode; no forwarder).
+    recursor: Option<Recursor>,
     cache: Cache,
     flight: Singleflight,
     metrics: Arc<Metrics>,
@@ -58,8 +62,10 @@ pub struct ResolverOptions {
     pub cache_size: usize,
     pub rpz: Rpz,
     pub signed: HashMap<DnsName, Arc<SignedZone>>,
-    /// Enable DNSSEC validation of forwarded answers (root trust anchor).
+    /// Enable DNSSEC validation of answers (root trust anchor).
     pub validate: bool,
+    /// Recursive mode: resolve iteratively from the root instead of forwarding.
+    pub recursive: bool,
 }
 
 /// Result of the synchronous resolution attempt.
@@ -91,6 +97,7 @@ impl Resolver {
             rpz: RwLock::new(Arc::new(opts.rpz)),
             signed: RwLock::new(Arc::new(opts.signed)),
             validator: opts.validate.then(Validator::with_root),
+            recursor: opts.recursive.then(Recursor::new),
             cache: Cache::new(opts.cache_size.max(1)),
             flight: Singleflight::default(),
             metrics,
@@ -129,15 +136,19 @@ impl Resolver {
         self.signed.read().unwrap().clone()
     }
 
-    /// The upstream pool responsible for `name`: the most specific forward
-    /// zone, falling back to the default resolvers.
-    fn pool_for(&self, name: &DnsName) -> Option<&UpstreamPool> {
+    /// The most specific conditional-forward pool for `name`, if any.
+    fn forward_pool_for(&self, name: &DnsName) -> Option<&UpstreamPool> {
         self.forwards
             .iter()
             .filter(|(zone, _)| name.ends_with(zone))
             .max_by_key(|(zone, _)| zone.label_count())
             .map(|(_, pool)| pool)
-            .or(self.pool.as_ref())
+    }
+
+    /// True if we can resolve `name` for a client: a conditional forward, the
+    /// recursor, or the default upstream pool can handle it.
+    fn can_recurse(&self, name: &DnsName) -> bool {
+        self.forward_pool_for(name).is_some() || self.recursor.is_some() || self.pool.is_some()
     }
 
     /// Replace or add a single zone (secondary transfers).
@@ -218,7 +229,8 @@ impl Resolver {
             return Outcome::Done(resp);
         }
         resp.flags.ra =
-            (self.pool.is_some() || !self.forwards.is_empty()) && recursion_allowed;
+            (self.pool.is_some() || self.recursor.is_some() || !self.forwards.is_empty())
+                && recursion_allowed;
 
         // Authoritative data wins over forwarding.
         let zones = self.zones();
@@ -265,7 +277,7 @@ impl Resolver {
             // A CNAME chain that leaves the zone: keep resolving if the
             // client asked for recursion and is allowed to use it.
             if let Some(target) = result.offsite {
-                if query.flags.rd && self.pool_for(&target).is_some() && recursion_allowed {
+                if query.flags.rd && self.can_recurse(&target) && recursion_allowed {
                     let key = Key { qname: target.clone(), qtype: q.qtype };
                     if let Some(hit) = self.cache_get(&key) {
                         merge(&mut resp, hit, true);
@@ -308,7 +320,7 @@ impl Resolver {
             return Outcome::Done(resp);
         }
 
-        if !query.flags.rd || self.pool_for(&q.qname).is_none() {
+        if !query.flags.rd || !self.can_recurse(&q.qname) {
             resp.flags.rcode = RCODE_REFUSED;
             return Outcome::Done(resp);
         }
@@ -377,19 +389,35 @@ impl Resolver {
             match self.flight.begin(&key) {
                 Role::Leader(_guard) => {
                     Metrics::inc(&self.metrics.cache_misses);
-                    let pool = self.pool_for(qname).ok_or(ForwardError::NoUpstream)?;
+                    // Route: conditional forward > iterative recursor > default
+                    // upstream pool. The DNSSEC fetcher tracks the same source
+                    // so chain building uses the matching transport.
+                    let fwd = self.forward_pool_for(qname);
+                    let fetcher: &dyn validator::DnssecFetcher = match (fwd, &self.recursor) {
+                        (Some(p), _) => p,
+                        (None, Some(r)) => r,
+                        (None, None) => self.pool.as_ref().ok_or(ForwardError::NoUpstream)?,
+                    };
 
-                    // With validation on, fetch with DO=1 and check the chain.
                     let (msg, secure) = match &self.validator {
                         Some(v) => {
-                            let m = pool.query_dnssec(qname, qtype, &self.metrics).await?;
-                            match v.validate(pool, &self.metrics, &m).await {
+                            // Fetch with DO+CD and verify the chain of trust.
+                            let m = fetcher.fetch_dnssec(qname, qtype, &self.metrics).await?;
+                            match v.validate(fetcher, &self.metrics, &m).await {
                                 Security::Bogus => return Err(ForwardError::Bogus),
                                 Security::Secure => (m, true),
                                 Security::Insecure => (m, false),
                             }
                         }
-                        None => (pool.query(qname, qtype, &self.metrics).await?, false),
+                        // No validation: forward plainly, or resolve iteratively.
+                        None => match (fwd, &self.recursor) {
+                            (Some(p), _) => (p.query(qname, qtype, &self.metrics).await?, false),
+                            (None, Some(r)) => (r.resolve(qname, qtype, &self.metrics).await?, false),
+                            (None, None) => {
+                                let p = self.pool.as_ref().ok_or(ForwardError::NoUpstream)?;
+                                (p.query(qname, qtype, &self.metrics).await?, false)
+                            }
+                        },
                     };
 
                     // Keep only the SOA from the authority section — it is
@@ -418,8 +446,13 @@ impl Resolver {
             }
         }
         // Leaders kept failing with uncacheable results; go direct.
-        let pool = self.pool_for(qname).ok_or(ForwardError::NoUpstream)?;
-        let msg = pool.query(qname, qtype, &self.metrics).await?;
+        let fwd = self.forward_pool_for(qname);
+        let fetcher: &dyn validator::DnssecFetcher = match (fwd, &self.recursor) {
+            (Some(p), _) => p,
+            (None, Some(r)) => r,
+            (None, None) => self.pool.as_ref().ok_or(ForwardError::NoUpstream)?,
+        };
+        let msg = fetcher.fetch_dnssec(qname, qtype, &self.metrics).await?;
         Ok((msg.flags.rcode, msg.answers, Vec::new(), false))
     }
 }

@@ -18,7 +18,40 @@ use dns_proto::message::{
 };
 use dns_proto::name::DnsName;
 
-use crate::upstream::UpstreamPool;
+use crate::ForwardError;
+
+/// Source of DNSKEY/DS lookups during chain building — either the upstream
+/// pool (forward mode) or the iterative recursor.
+pub trait DnssecFetcher: Sync {
+    fn fetch_dnssec<'a>(
+        &'a self,
+        name: &'a DnsName,
+        qtype: u16,
+        metrics: &'a Metrics,
+    ) -> BoxFut<'a, Result<Message, ForwardError>>;
+}
+
+impl DnssecFetcher for crate::upstream::UpstreamPool {
+    fn fetch_dnssec<'a>(
+        &'a self,
+        name: &'a DnsName,
+        qtype: u16,
+        metrics: &'a Metrics,
+    ) -> BoxFut<'a, Result<Message, ForwardError>> {
+        Box::pin(self.query_dnssec(name, qtype, metrics))
+    }
+}
+
+impl DnssecFetcher for crate::recursor::Recursor {
+    fn fetch_dnssec<'a>(
+        &'a self,
+        name: &'a DnsName,
+        qtype: u16,
+        metrics: &'a Metrics,
+    ) -> BoxFut<'a, Result<Message, ForwardError>> {
+        Box::pin(self.resolve(name, qtype, metrics))
+    }
+}
 
 const MAX_DEPTH: usize = 20;
 
@@ -66,7 +99,7 @@ pub struct Validator {
 
 /// Per-validation state threaded through the chain walk.
 struct Ctx<'a> {
-    pool: &'a UpstreamPool,
+    fetcher: &'a dyn DnssecFetcher,
     metrics: &'a Metrics,
     /// zone -> validated DNSKEY rdata list (`Some(vec![])` = bogus,
     /// `None` = insecure).
@@ -90,11 +123,11 @@ impl Validator {
     /// the result is Bogus if a signature fails or a denial is not proven.
     pub async fn validate(
         &self,
-        pool: &UpstreamPool,
+        fetcher: &dyn DnssecFetcher,
         metrics: &Metrics,
         msg: &Message,
     ) -> Security {
-        let mut ctx = Ctx { pool, metrics, keys: HashMap::new() };
+        let mut ctx = Ctx { fetcher, metrics, keys: HashMap::new() };
 
         // 1) Answer section.
         let answer = self.verify_section(&mut ctx, &msg.answers).await;
@@ -220,7 +253,7 @@ impl Validator {
             }
 
             // Fetch the DNSKEY rrset and its RRSIG.
-            let msg = ctx.pool.query_dnssec(zone, TYPE_DNSKEY, ctx.metrics).await.ok();
+            let msg = ctx.fetcher.fetch_dnssec(zone, TYPE_DNSKEY, ctx.metrics).await.ok();
             let msg = match msg {
                 Some(m) => m,
                 None => {
@@ -311,16 +344,33 @@ impl Validator {
             None => return DsResult::Insecure, // parent insecure => child insecure
         };
 
-        let msg = match ctx.pool.query_dnssec(zone, TYPE_DS, ctx.metrics).await {
+        let msg = match ctx.fetcher.fetch_dnssec(zone, TYPE_DS, ctx.metrics).await {
             Ok(m) => m,
             Err(_) => return DsResult::Bogus,
         };
         let ds_records: Vec<Record> =
             msg.answers.iter().filter(|r| r.rtype() == TYPE_DS).cloned().collect();
         if ds_records.is_empty() {
-            // No DS: an insecure delegation (we trust the upstream's NODATA
-            // here rather than validating the NSEC proof).
-            return DsResult::Insecure;
+            // No DS in the answer. Before declaring the delegation insecure we
+            // must *authenticate* the absence of the DS (anti-downgrade,
+            // RFC 4035 §5): the parent's NSEC/NSEC3 must be validly signed and
+            // must prove there is no DS type at the child name. Otherwise an
+            // attacker who strips the DS could silently disable DNSSEC.
+            let auth = self.verify_section(&mut *ctx, &msg.authorities).await;
+            if auth.bogus {
+                return DsResult::Bogus;
+            }
+            if auth.any_secure && authenticated_no_ds(zone, &msg.authorities) {
+                return DsResult::Insecure;
+            }
+            // Unsigned parent (truly insecure) vs. a stripped DS: if the parent
+            // zone itself is secure we just validated its keys, so a missing
+            // proof here is bogus; an unsigned parent has no NSEC to check.
+            let parent_secure = self
+                .dnskeys(&mut *ctx, &parent, depth + 1)
+                .await
+                .is_some_and(|k| !k.is_empty());
+            return if parent_secure { DsResult::Bogus } else { DsResult::Insecure };
         }
         // The DS rrset must be signed by the parent's validated keys.
         let signed = msg
@@ -360,6 +410,58 @@ struct SectionResult {
 
 fn has_nsec(records: &[Record]) -> bool {
     records.iter().any(|r| matches!(r.rtype(), TYPE_NSEC | TYPE_NSEC3))
+}
+
+/// True if the (already signature-checked) NSEC/NSEC3 records prove that no DS
+/// record exists at `zone` — i.e. the delegation is genuinely insecure and not
+/// a stripped-DS downgrade. An NSEC/NSEC3 matching the name must have the NS
+/// bit set (it is a delegation point) and the DS bit clear.
+fn authenticated_no_ds(zone: &DnsName, authority: &[Record]) -> bool {
+    use dns_proto::message::{TYPE_DS, TYPE_NS};
+    // NSEC: exact owner match with NS present and DS absent.
+    for rec in authority.iter().filter(|r| r.rtype() == TYPE_NSEC) {
+        if rec.name != *zone {
+            continue;
+        }
+        let RData::Unknown { data, .. } = &rec.rdata else { continue };
+        if let Some((_, types)) = parse_nsec(data) {
+            if types.contains(&TYPE_NS) && !types.contains(&TYPE_DS) {
+                return true;
+            }
+        }
+    }
+    // NSEC3: either an exact match (NS set, DS clear) or — the common case for
+    // TLDs — an opt-out NSEC3 whose range covers the name (RFC 5155 §6),
+    // which authorizes an unsigned delegation without its own NSEC3.
+    let nsec3: Vec<&Record> = authority.iter().filter(|r| r.rtype() == TYPE_NSEC3).collect();
+    if let Some(params) = nsec3.iter().find_map(|r| match &r.rdata {
+        RData::Unknown { data, .. } => parse_nsec3(data).map(|(p, _, _)| p),
+        _ => None,
+    }) {
+        let want = hash_name(zone, &params);
+        for rec in &nsec3 {
+            let Some(owner) = nsec3_owner_hash(&rec.name) else { continue };
+            let RData::Unknown { data, .. } = &rec.rdata else { continue };
+            let opt_out = data.get(1).is_some_and(|f| f & 0x01 != 0);
+            let Some((_, next, types)) = parse_nsec3(data) else { continue };
+            // Exact match: name exists as an insecure delegation.
+            if owner == want && types.contains(&TYPE_NS) && !types.contains(&TYPE_DS) {
+                return true;
+            }
+            // Opt-out coverage: owner < hash(name) <= next (with wrap).
+            if opt_out {
+                let covers = if owner < next {
+                    owner.as_slice() < want.as_slice() && want.as_slice() <= next.as_slice()
+                } else {
+                    want.as_slice() > owner.as_slice() || want.as_slice() <= next.as_slice()
+                };
+                if covers {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Canonical name ordering key (RFC 4034 §6.1): labels compared right-to-left.
@@ -532,5 +634,67 @@ mod tests {
         assert_eq!(u16::from_be_bytes([a.ds_rdata[0], a.ds_rdata[1]]), 20326);
         assert_eq!(a.ds_rdata[2], 8); // RSA/SHA-256
         assert_eq!(a.ds_rdata[3], 2); // SHA-256
+    }
+
+    #[test]
+    fn base32hex_decodes_rfc4648_vectors() {
+        // Inverse of the encoder used to name NSEC3 records.
+        assert_eq!(base32hex_decode("co").unwrap(), b"f");
+        assert_eq!(base32hex_decode("cpng").unwrap(), b"fo");
+        assert_eq!(base32hex_decode("cpnmu").unwrap(), b"foo");
+        assert_eq!(base32hex_decode("CPNMU").unwrap(), b"foo"); // case-insensitive
+        assert!(base32hex_decode("!!!").is_none());
+    }
+
+    #[test]
+    fn type_bitmap_roundtrip() {
+        // Window 0: A(1), NS(2), RRSIG(46), NSEC(47).  Window 1: 256+43 = 299.
+        let data = [
+            0, 6, 0b0110_0000, 0, 0, 0, 0, 0b0000_0011, // window 0, 6 bytes
+            1, 6, 0, 0, 0, 0, 0, 0b0001_0000, // window 1, byte 5 bit 3 -> 299
+        ];
+        let types = parse_type_bitmap(&data);
+        assert!(types.contains(&1) && types.contains(&2));
+        assert!(types.contains(&46) && types.contains(&47));
+        assert!(types.contains(&299));
+        assert!(!types.contains(&3));
+    }
+
+    #[test]
+    fn parse_type_bitmap_never_panics_on_garbage() {
+        // Truncated / lying window lengths must not panic.
+        for data in [
+            &[0u8, 200, 1][..],   // claims 200 bytes, has 1
+            &[0][..],             // dangling window byte
+            &[1, 2][..],          // window+len, no bitmap
+            &[255, 255][..],
+        ] {
+            let _ = parse_type_bitmap(data);
+        }
+    }
+
+    #[test]
+    fn nsec_coverage_and_nodata() {
+        use dns_proto::message::{CLASS_IN, RData, Record, TYPE_A, TYPE_MX};
+        let n = |s| DnsName::parse_str(s).unwrap();
+        // NSEC at "b.example" -> next "d.example", types A + RRSIG + NSEC.
+        let mut rdata = Vec::new();
+        n("d.example").to_wire(&mut rdata, None);
+        rdata.extend_from_slice(&[0, 6, 0b0100_0000, 0, 0, 0, 0, 0b0000_0011]); // A(1),RRSIG(46),NSEC(47)
+        let nsec = Record {
+            name: n("b.example"),
+            class: CLASS_IN,
+            ttl: 300,
+            rdata: RData::Unknown { rtype: dns_proto::message::TYPE_NSEC, data: rdata },
+        };
+        let recs = [&nsec];
+        // NXDOMAIN: "c.example" falls between b and d -> covered.
+        assert!(nsec_proves(&n("c.example"), TYPE_A, &recs));
+        // Outside the range -> not covered.
+        assert!(!nsec_proves(&n("z.example"), TYPE_A, &recs));
+        // NODATA: exact owner "b.example", query MX (absent from the bitmap).
+        assert!(nsec_proves(&n("b.example"), TYPE_MX, &recs));
+        // The owner *does* have A -> not proven absent.
+        assert!(!nsec_proves(&n("b.example"), TYPE_A, &recs));
     }
 }

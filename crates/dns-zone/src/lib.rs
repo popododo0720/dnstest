@@ -283,6 +283,119 @@ impl Zone {
         self.record_count = self.records.values().map(Vec::len).sum();
     }
 
+    /// Apply an RFC 2136 dynamic update: check `prereqs`, then apply `updates`.
+    /// Returns the DNS rcode (NOERROR on success). The zone is only mutated
+    /// when all prerequisites pass, so a failed update leaves it untouched.
+    pub fn apply_update(&mut self, prereqs: &[Record], updates: &[Record]) -> u8 {
+        use dns_proto::message::{
+            CLASS_ANY, CLASS_IN, CLASS_NONE, RCODE_FORMERR, RCODE_NOERROR, RCODE_NOTAUTH,
+            RCODE_NXRRSET, RCODE_YXRRSET, TYPE_ANY,
+        };
+
+        // 1) Prerequisites (RFC 2136 §3.2).
+        for p in prereqs {
+            if !p.name.ends_with(&self.origin) {
+                return RCODE_NOTAUTH;
+            }
+            let exists_name = self.records.contains_key(&p.name);
+            let exists_type =
+                self.records.get(&p.name).is_some_and(|rrs| rrs.iter().any(|r| r.rtype() == p.rtype()));
+            match p.class {
+                // "RRset exists (value independent)": name+type must exist.
+                CLASS_ANY if p.rtype() != TYPE_ANY => {
+                    if !exists_type {
+                        return RCODE_NXRRSET;
+                    }
+                }
+                // "Name is in use": any records at the name.
+                CLASS_ANY => {
+                    if !exists_name {
+                        return dns_proto::message::RCODE_NXDOMAIN;
+                    }
+                }
+                // "RRset does not exist": name+type must be absent.
+                CLASS_NONE if p.rtype() != TYPE_ANY => {
+                    if exists_type {
+                        return RCODE_YXRRSET;
+                    }
+                }
+                // "Name is not in use".
+                CLASS_NONE => {
+                    if exists_name {
+                        return dns_proto::message::RCODE_YXDOMAIN;
+                    }
+                }
+                // "RRset exists (value dependent)": exact rrset must match.
+                CLASS_IN => {
+                    let matches = self
+                        .records
+                        .get(&p.name)
+                        .is_some_and(|rrs| rrs.iter().any(|r| r.rtype() == p.rtype() && r.rdata == p.rdata));
+                    if !matches {
+                        return RCODE_NXRRSET;
+                    }
+                }
+                _ => return RCODE_FORMERR,
+            }
+        }
+
+        // 2) Updates (RFC 2136 §3.4). Prescan for the SOA class rules.
+        for u in updates {
+            if !u.name.ends_with(&self.origin) {
+                return RCODE_NOTAUTH;
+            }
+        }
+        for u in updates {
+            match u.class {
+                // Add an RR (dedup).
+                CLASS_IN => {
+                    // CNAME/other-data exclusivity is enforced loosely: replace
+                    // is done by delete-then-add in a typical nsupdate flow.
+                    let node = self.records.entry(u.name.clone()).or_default();
+                    if !node.iter().any(|r| r.rtype() == u.rtype() && r.rdata == u.rdata) {
+                        node.push(u.clone());
+                    } else if let Some(existing) =
+                        node.iter_mut().find(|r| r.rtype() == u.rtype() && r.rdata == u.rdata)
+                    {
+                        existing.ttl = u.ttl; // refresh TTL
+                    }
+                }
+                // Delete an RRset, or all RRsets at a name (type ANY).
+                CLASS_ANY => {
+                    if u.rtype() == TYPE_ANY {
+                        // Never delete the apex SOA/NS via "delete all".
+                        if u.name == self.origin {
+                            if let Some(node) = self.records.get_mut(&u.name) {
+                                node.retain(|r| {
+                                    r.rtype() == dns_proto::message::TYPE_SOA
+                                        || r.rtype() == dns_proto::message::TYPE_NS
+                                });
+                            }
+                        } else {
+                            self.records.remove(&u.name);
+                        }
+                    } else if let Some(node) = self.records.get_mut(&u.name) {
+                        // Refuse to delete the apex SOA.
+                        if !(u.name == self.origin && u.rtype() == dns_proto::message::TYPE_SOA) {
+                            node.retain(|r| r.rtype() != u.rtype());
+                        }
+                    }
+                }
+                // Delete an individual RR.
+                CLASS_NONE => {
+                    if let Some(node) = self.records.get_mut(&u.name) {
+                        node.retain(|r| !(r.rtype() == u.rtype() && r.rdata == u.rdata));
+                    }
+                }
+                _ => return RCODE_FORMERR,
+            }
+            self.records.retain(|_, v| !v.is_empty());
+        }
+
+        self.recount();
+        RCODE_NOERROR
+    }
+
     /// Serialize back to master-file format (round-trips through
     /// [`parse_zone_file`]).
     pub fn to_zonefile(&self) -> String {
@@ -400,6 +513,15 @@ fn parse_num<T: std::str::FromStr>(s: &str, line_no: usize, what: &str) -> Resul
     s.parse().map_err(|_| err(line_no, format!("bad {what} value '{s}'")))
 }
 
+/// Decode a hex string (RFC 3597 generic rdata); ignores nothing, rejects odd
+/// length or non-hex digits.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+}
+
 fn parse_rdata(
     rtype: &str,
     toks: &[Tok],
@@ -413,6 +535,24 @@ fn parse_rdata(
             Err(err(line_no, format!("{rtype} expects {n} field(s), got {}", toks.len())))
         }
     };
+
+    // RFC 3597 generic form `\# <len> <hex>` works for ANY named type,
+    // including the typed ones (this is what serialized Unknown rdata uses).
+    if toks.first().map(Tok::text) == Some("\\#") {
+        let code = dns_proto::message::type_code(rtype)
+            .ok_or_else(|| err(line_no, format!("unknown record type '{rtype}'")))?;
+        if toks.len() < 2 {
+            return Err(err(line_no, "generic rdata: missing length"));
+        }
+        let len: usize = parse_num(toks[1].text(), line_no, "generic rdata length")?;
+        let hex: String = toks[2..].iter().map(Tok::text).collect();
+        let data = decode_hex(&hex).ok_or_else(|| err(line_no, "generic rdata: bad hex"))?;
+        if data.len() != len {
+            return Err(err(line_no, format!("generic rdata: length {len} != {} bytes", data.len())));
+        }
+        return Ok(RData::Unknown { rtype: code, data });
+    }
+
     match rtype {
         "A" => {
             want(1)?;
@@ -478,6 +618,24 @@ fn parse_rdata(
                 target: resolve_name(toks[3].text(), origin, line_no)?,
             })
         }
+        "CAA" => {
+            // flags tag "value"  e.g.  0 issue "letsencrypt.org"
+            want(3)?;
+            let flags: u8 = parse_num(toks[0].text(), line_no, "CAA flags")?;
+            let tag = toks[1].text().as_bytes();
+            if tag.is_empty() || tag.len() > 255 {
+                return Err(err(line_no, "CAA tag length"));
+            }
+            let value = toks[2].text().as_bytes();
+            let mut data = vec![flags, tag.len() as u8];
+            data.extend_from_slice(tag);
+            data.extend_from_slice(value);
+            Ok(RData::Unknown { rtype: dns_proto::message::TYPE_CAA, data })
+        }
+        other if dns_proto::message::type_code(other).is_some() => Err(err(
+            line_no,
+            format!("{other}: provide rdata in RFC 3597 generic form `\\# <len> <hex>`"),
+        )),
         other => Err(err(line_no, format!("unsupported record type '{other}'"))),
     }
 }
@@ -680,6 +838,81 @@ _http._tcp IN SRV 0 5 8080 www
         let RData::Txt(strings) = &r.answers[0].rdata else { panic!() };
         assert_eq!(strings.len(), 2);
         assert_eq!(strings[0], b"hello from rdns");
+    }
+
+    #[test]
+    fn dynamic_update_add_delete_prereq() {
+        use dns_proto::message::{
+            CLASS_ANY, CLASS_IN, CLASS_NONE, RCODE_NOERROR, RCODE_NXRRSET, TYPE_A, TYPE_ANY,
+        };
+        use std::net::Ipv4Addr;
+        let mut z = parse_zone_file(
+            "$ORIGIN t.\n$TTL 300\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A 10.0.0.1\nold IN A 10.0.0.9\n",
+        )
+        .unwrap();
+
+        let rec = |name: &str, class: u16, rdata: RData| Record {
+            name: n(name),
+            class,
+            ttl: 60,
+            rdata,
+        };
+
+        // Add a new A record.
+        let add = rec("new.t", CLASS_IN, RData::A(Ipv4Addr::new(10, 0, 0, 50)));
+        assert_eq!(z.apply_update(&[], std::slice::from_ref(&add)), RCODE_NOERROR);
+        assert_eq!(z.lookup(&n("new.t"), TYPE_A).answers.len(), 1);
+
+        // Prerequisite: "old must exist" passes; delete its rrset (class ANY).
+        let prereq = rec("old.t", CLASS_ANY, RData::Unknown { rtype: TYPE_A, data: vec![] });
+        let del = Record { name: n("old.t"), class: CLASS_ANY, ttl: 0, rdata: RData::Unknown { rtype: TYPE_A, data: vec![] } };
+        assert_eq!(z.apply_update(&[prereq], &[del]), RCODE_NOERROR);
+        assert_eq!(z.lookup(&n("old.t"), TYPE_A).rcode, dns_proto::message::RCODE_NXDOMAIN);
+
+        // Prerequisite failure leaves the zone untouched.
+        let bad_prereq = Record { name: n("missing.t"), class: CLASS_ANY, ttl: 0, rdata: RData::Unknown { rtype: TYPE_A, data: vec![] } };
+        let would_add = rec("wont.t", CLASS_IN, RData::A(Ipv4Addr::new(1, 1, 1, 1)));
+        assert_eq!(z.apply_update(&[bad_prereq], &[would_add]), RCODE_NXRRSET);
+        assert_eq!(z.lookup(&n("wont.t"), TYPE_A).rcode, dns_proto::message::RCODE_NXDOMAIN);
+
+        // Delete an individual RR (class NONE).
+        let del_one = Record { name: n("new.t"), class: CLASS_NONE, ttl: 0, rdata: RData::A(Ipv4Addr::new(10, 0, 0, 50)) };
+        assert_eq!(z.apply_update(&[], &[del_one]), RCODE_NOERROR);
+        assert_eq!(z.lookup(&n("new.t"), TYPE_A).rcode, dns_proto::message::RCODE_NXDOMAIN);
+
+        // The apex SOA cannot be deleted by "delete all types".
+        let nuke = Record { name: n("t"), class: CLASS_ANY, ttl: 0, rdata: RData::Unknown { rtype: TYPE_ANY, data: vec![] } };
+        z.apply_update(&[], &[nuke]);
+        assert!(z.lookup(&n("t"), dns_proto::message::TYPE_SOA).answers.len() == 1);
+    }
+
+    #[test]
+    fn caa_and_generic_types() {
+        let z = parse_zone_file(
+            "$ORIGIN t.\n$TTL 300\n@ IN SOA ns h 1 2 3 4 5\n\
+             @ IN CAA 0 issue \"letsencrypt.org\"\n\
+             _443._tcp IN TYPE52 \\# 4 03010203\n\
+             sub IN HTTPS \\# 3 000001\n",
+        )
+        .unwrap();
+        // CAA stored as generic rdata with the right type.
+        let caa = z.lookup(&n("t"), dns_proto::message::TYPE_CAA);
+        assert_eq!(caa.answers.len(), 1);
+        // TLSA via TYPE52 generic form.
+        let tlsa = z.lookup(&n("_443._tcp.t"), 52);
+        assert_eq!(tlsa.answers.len(), 1);
+        if let RData::Unknown { data, .. } = &tlsa.answers[0].rdata {
+            assert_eq!(data, &[0x03, 0x01, 0x02, 0x03]);
+        } else {
+            panic!("expected generic rdata");
+        }
+        // HTTPS (type 65) authorable via generic form.
+        let https = z.lookup(&n("sub.t"), dns_proto::message::TYPE_HTTPS);
+        assert_eq!(https.answers.len(), 1);
+
+        // Serialize and re-parse: generic rdata round-trips.
+        let text = z.to_zonefile();
+        assert!(parse_zone_file(&text).is_ok(), "generated zone must re-parse");
     }
 
     #[test]
