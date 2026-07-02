@@ -1,0 +1,11 @@
+[package]
+name = "dns-tsig"
+description = "TSIG transaction signatures (RFC 8945), HMAC-SHA256"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dns-proto.workspace = true
+ring.workspace = true
+
+[dev-dependencies]

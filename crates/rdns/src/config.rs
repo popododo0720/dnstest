@@ -31,6 +31,12 @@ pub struct Config {
     #[serde(rename = "forward")]
     pub forwards: Vec<ForwardCfg>,
     pub rpz: RpzCfg,
+    /// TSIG keys usable for transfers, indexed by name.
+    #[serde(rename = "tsig_key")]
+    pub tsig_keys: Vec<TsigKeyCfg>,
+    pub dnssec: DnssecCfg,
+    /// DNS-over-TLS / DNS-over-HTTPS; absent = disabled.
+    pub tls: Option<TlsCfg>,
 }
 
 impl Default for Config {
@@ -49,6 +55,9 @@ impl Default for Config {
             secondaries: Vec::new(),
             forwards: Vec::new(),
             rpz: RpzCfg::default(),
+            tsig_keys: Vec::new(),
+            dnssec: DnssecCfg::default(),
+            tls: None,
         }
     }
 }
@@ -60,6 +69,8 @@ pub struct TransferCfg {
     pub allow: Vec<String>,
     /// Secondaries to NOTIFY when a zone changes.
     pub notify: Vec<SocketAddr>,
+    /// Require this TSIG key name on AXFR/IXFR requests (empty = IP ACL only).
+    pub require_tsig: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +78,67 @@ pub struct TransferCfg {
 pub struct SecondaryCfg {
     pub zone: String,
     pub primaries: Vec<SocketAddr>,
+    /// TSIG key name to sign transfer requests with.
+    #[serde(default)]
+    pub tsig_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TsigKeyCfg {
+    pub name: String,
+    /// "hmac-sha256" (default) or "hmac-sha512".
+    #[serde(default = "default_tsig_alg")]
+    pub algorithm: String,
+    /// Base64-encoded shared secret.
+    pub secret: String,
+}
+
+fn default_tsig_alg() -> String {
+    "hmac-sha256".into()
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DnssecCfg {
+    /// File holding the Ed25519 seed (base64). Auto-generated if missing.
+    pub key_file: Option<PathBuf>,
+    /// Zone origins to sign online.
+    pub zones: Vec<String>,
+    /// Signature validity window in days.
+    #[serde(default = "default_validity_days")]
+    pub validity_days: u64,
+}
+
+fn default_validity_days() -> u64 {
+    14
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TlsCfg {
+    /// PEM certificate chain; self-signed if omitted (dev only).
+    pub cert: Option<PathBuf>,
+    /// PEM private key.
+    pub key: Option<PathBuf>,
+    /// Names for the self-signed certificate.
+    pub self_signed_names: Vec<String>,
+    /// DNS-over-TLS listen address (RFC 7858, usually :853).
+    pub dot_listen: Option<SocketAddr>,
+    /// DNS-over-HTTPS listen address (RFC 8484).
+    pub doh_listen: Option<SocketAddr>,
+}
+
+impl Default for TlsCfg {
+    fn default() -> Self {
+        TlsCfg {
+            cert: None,
+            key: None,
+            self_signed_names: vec!["localhost".into()],
+            dot_listen: None,
+            doh_listen: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

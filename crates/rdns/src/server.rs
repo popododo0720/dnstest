@@ -18,14 +18,24 @@ use dns_proto::message::{
     Flags, Message, OPCODE_NOTIFY, RCODE_FORMERR, RCODE_NOTIMP, RCODE_REFUSED, TYPE_AXFR,
     rcode_name, type_name,
 };
+use dns_proto::message::{RData, TYPE_IXFR};
 use dns_proto::name::DnsName;
 use dns_resolver::{Outcome, Resolver};
-use dns_xfr::Secondary;
+use dns_tsig::{KeyRing, TsigError, verify as tsig_verify};
+use dns_xfr::{Journal, Secondary};
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::timeout;
 use tracing::{debug, info};
+
+/// Seconds since the Unix epoch, for TSIG time checks.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -40,6 +50,12 @@ pub struct ServerCtx {
     pub transfer_acl: Acl,
     /// Secondary zones by origin, for routing incoming NOTIFYs.
     pub secondaries: HashMap<DnsName, Arc<Secondary>>,
+    /// Change history for incremental (IXFR) transfers.
+    pub journal: Arc<Journal>,
+    /// TSIG keys accepted on transfers.
+    pub tsig_keys: KeyRing,
+    /// When set, AXFR/IXFR must carry a valid TSIG signed by this key.
+    pub require_tsig: Option<DnsName>,
 }
 
 /// N kernel-load-balanced sockets bound to the same address.
@@ -142,16 +158,120 @@ pub async fn run_tcp(listener: TcpListener, ctx: Arc<ServerCtx>) -> std::io::Res
     loop {
         let (stream, peer) = listener.accept().await?;
         let ctx = ctx.clone();
+        tokio::spawn(serve_tcp_conn(stream, peer, ctx));
+    }
+}
+
+/// DNS-over-TLS (RFC 7858): TLS handshake, then the same framed DNS loop.
+pub async fn run_dot(
+    listener: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    ctx: Arc<ServerCtx>,
+) -> std::io::Result<()> {
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        let ctx = ctx.clone();
         tokio::spawn(async move {
-            let _ = serve_tcp_conn(stream, peer, ctx).await;
+            match acceptor.accept(stream).await {
+                Ok(tls) => {
+                    let _ = serve_stream(tls, peer, ctx, "dot").await;
+                }
+                Err(e) => debug!("dot {peer}: tls handshake failed: {e}"),
+            }
         });
     }
 }
 
-async fn serve_tcp_conn(
-    mut stream: TcpStream,
+/// DNS-over-HTTPS (RFC 8484): TLS + minimal HTTP/1.1, GET/POST /dns-query.
+pub async fn run_doh(
+    listener: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    ctx: Arc<ServerCtx>,
+) -> std::io::Result<()> {
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            match acceptor.accept(stream).await {
+                Ok(tls) => {
+                    let _ = serve_doh_conn(tls, peer, ctx).await;
+                }
+                Err(e) => debug!("doh {peer}: tls handshake failed: {e}"),
+            }
+        });
+    }
+}
+
+async fn serve_doh_conn<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     peer: SocketAddr,
     ctx: Arc<ServerCtx>,
+) -> std::io::Result<()> {
+    // Read the HTTP request head, then the body per Content-Length.
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 2048];
+    let header_end = loop {
+        let n = match timeout(TCP_READ_TIMEOUT, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) | Err(_) | Ok(Err(_)) => return Ok(()),
+            Ok(Ok(n)) => n,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        if buf.len() > 8192 {
+            let _ = stream.write_all(&dns_tls::http_error("431 Request Header Fields Too Large")).await;
+            return Ok(());
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+    let content_length: usize = head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
+        })
+        .unwrap_or(0);
+    if content_length > 65535 {
+        let _ = stream.write_all(&dns_tls::http_error("413 Payload Too Large")).await;
+        return Ok(());
+    }
+    let mut body = buf[header_end..].to_vec();
+    while body.len() < content_length {
+        let n = match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return Ok(()),
+            Ok(n) => n,
+        };
+        body.extend_from_slice(&chunk[..n]);
+    }
+    body.truncate(content_length);
+
+    Metrics::inc(&ctx.metrics.queries_tcp);
+    let response = match dns_tls::parse_doh(&head, &body) {
+        Some(req) => {
+            let started = Instant::now();
+            let dns = handle_query_bytes(&ctx, &req.dns, peer, "doh", started).await;
+            dns_tls::doh_response(&dns)
+        }
+        None => dns_tls::http_error("404 Not Found"),
+    };
+    stream.write_all(&response).await?;
+    Ok(())
+}
+
+/// Drive one DNS/TCP connection over any byte stream (plain TCP or, for DoT,
+/// a TLS stream), using RFC 7766 length-prefixed framing.
+async fn serve_tcp_conn(stream: TcpStream, peer: SocketAddr, ctx: Arc<ServerCtx>) {
+    let _ = serve_stream(stream, peer, ctx, "tcp").await;
+}
+
+pub async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    peer: SocketAddr,
+    ctx: Arc<ServerCtx>,
+    proto: &str,
 ) -> std::io::Result<()> {
     loop {
         // RFC 7766: each message is prefixed with a two-byte length.
@@ -179,41 +299,19 @@ async fn serve_tcp_conn(
             }
         }
 
+        // Zone transfers stream multiple framed messages directly.
+        if let Ok(query) = Message::parse(&data) {
+            if is_transfer(&query) {
+                let frames = transfer_out(&ctx, peer, &query, &data);
+                for frame in frames {
+                    stream.write_all(&frame).await?;
+                }
+                continue;
+            }
+        }
+
         let started = Instant::now();
-        let reply = match Message::parse(&data) {
-            Ok(query) if is_axfr(&query) => {
-                match axfr_out(&ctx, peer, &query) {
-                    Ok(frames) => {
-                        Metrics::inc(&ctx.metrics.axfr_out);
-                        info!("tcp {peer} AXFR {} -> {} message(s)",
-                            query.questions[0].qname, frames.len());
-                        for frame in frames {
-                            stream.write_all(&frame).await?;
-                        }
-                        continue;
-                    }
-                    Err(rcode) => {
-                        let mut resp = Message::response_to(&query);
-                        resp.flags.rcode = rcode;
-                        observe(&ctx, "tcp", peer, &query, &resp, started);
-                        resp.encode()
-                    }
-                }
-            }
-            Ok(query) => {
-                let allowed = ctx.acl.is_allowed(peer.ip());
-                let resp = ctx.resolver.handle(&query, allowed).await;
-                observe(&ctx, "tcp", peer, &query, &resp, started);
-                resp.encode_limited(u16::MAX as usize)
-            }
-            Err(e) => {
-                debug!("tcp {peer}: unparseable query ({e})");
-                match formerr_reply(&data) {
-                    Some(r) => r,
-                    None => return Ok(()),
-                }
-            }
-        };
+        let reply = handle_query_bytes(&ctx, &data, peer, proto, started).await;
         let mut framed = Vec::with_capacity(reply.len() + 2);
         framed.extend_from_slice(&(reply.len() as u16).to_be_bytes());
         framed.extend_from_slice(&reply);
@@ -221,24 +319,152 @@ async fn serve_tcp_conn(
     }
 }
 
-fn is_axfr(query: &Message) -> bool {
-    query.flags.opcode == 0
-        && query.questions.len() == 1
-        && query.questions[0].qtype == TYPE_AXFR
+/// Resolve one query given its wire bytes and return the response wire.
+/// Shared by TCP, DoT, and DoH (transfers are handled separately).
+pub async fn handle_query_bytes(
+    ctx: &ServerCtx,
+    data: &[u8],
+    peer: SocketAddr,
+    proto: &str,
+    started: Instant,
+) -> Vec<u8> {
+    match Message::parse(data) {
+        Ok(query) => {
+            let allowed = ctx.acl.is_allowed(peer.ip());
+            let resp = ctx.resolver.handle(&query, allowed).await;
+            observe(ctx, proto, peer, &query, &resp, started);
+            // DoT/DoH have no 512-byte limit; TCP framing carries the rest.
+            resp.encode_limited(u16::MAX as usize)
+        }
+        Err(e) => {
+            debug!("{proto} {peer}: unparseable query ({e})");
+            formerr_reply(data).unwrap_or_default()
+        }
+    }
 }
 
-/// Zone transfer, gated by the transfer ACL. Returns the framed messages or
-/// the refusal rcode.
-fn axfr_out(ctx: &ServerCtx, peer: SocketAddr, query: &Message) -> Result<Vec<Vec<u8>>, u8> {
+fn is_transfer(query: &Message) -> bool {
+    query.flags.opcode == 0
+        && query.questions.len() == 1
+        && matches!(query.questions[0].qtype, TYPE_AXFR | TYPE_IXFR)
+}
+
+/// Serve an AXFR or IXFR, enforcing the transfer ACL and (when configured)
+/// TSIG. On refusal, returns a single framed error message.
+fn transfer_out(ctx: &ServerCtx, peer: SocketAddr, query: &Message, raw: &[u8]) -> Vec<Vec<u8>> {
+    let refuse = |rcode: u8| {
+        let mut resp = Message::response_to(query);
+        resp.flags.rcode = rcode;
+        frame_one(&resp.encode())
+    };
+
     if !ctx.transfer_acl.is_allowed(peer.ip()) {
-        return Err(RCODE_REFUSED);
+        return refuse(RCODE_REFUSED);
     }
+
+    // TSIG enforcement / verification.
+    let request_mac = match verify_transfer_tsig(ctx, query, raw) {
+        Ok(mac) => mac,
+        Err(rcode) => return refuse(rcode),
+    };
+
     let qname = &query.questions[0].qname;
     let zones = ctx.resolver.zones();
     let Some(zone) = zones.iter().find(|z| z.origin == *qname) else {
-        return Err(RCODE_NOTIMP);
+        return refuse(RCODE_NOTIMP);
     };
-    Ok(dns_xfr::axfr_messages(zone, query))
+
+    let frames = if query.questions[0].qtype == TYPE_IXFR {
+        let client_serial = query
+            .authorities
+            .iter()
+            .find_map(|r| match &r.rdata {
+                RData::Soa(soa) => Some(soa.serial),
+                _ => None,
+            })
+            .unwrap_or(0);
+        Metrics::inc(&ctx.metrics.axfr_out);
+        info!("{peer} IXFR {qname} from serial {client_serial}");
+        dns_xfr::ixfr_messages(zone, query, client_serial, &ctx.journal)
+    } else {
+        Metrics::inc(&ctx.metrics.axfr_out);
+        info!("{peer} AXFR {qname}");
+        dns_xfr::axfr_messages(zone, query)
+    };
+
+    // Sign each transfer message when the request was signed (RFC 8945 §5.3:
+    // every message in a signed transfer carries a TSIG chained on the prior
+    // MAC; the first uses the request MAC).
+    match (&request_mac, ctx.require_tsig.as_ref()) {
+        (Some(mac), _) => sign_transfer_frames(ctx, query, frames, mac),
+        _ => frames,
+    }
+}
+
+/// Verify TSIG on a transfer request. Returns the request MAC when signed,
+/// None when unsigned and TSIG is not required, or an rcode on failure.
+fn verify_transfer_tsig(
+    ctx: &ServerCtx,
+    query: &Message,
+    raw: &[u8],
+) -> Result<Option<Vec<u8>>, u8> {
+    if query.tsig.is_none() {
+        return if ctx.require_tsig.is_some() {
+            Err(dns_proto::message::RCODE_NOTAUTH) // TSIG required but absent
+        } else {
+            Ok(None)
+        };
+    }
+    match tsig_verify(query, raw, &ctx.tsig_keys, unix_now(), None) {
+        Ok(mac) => {
+            // If a specific key is required, enforce it.
+            if let Some(required) = &ctx.require_tsig {
+                if query.tsig.as_ref().map(|t| &t.key_name) != Some(required) {
+                    return Err(dns_proto::message::RCODE_NOTAUTH);
+                }
+            }
+            Ok(Some(mac))
+        }
+        Err(TsigError::BadTime) | Err(TsigError::BadSig) | Err(TsigError::BadKey)
+        | Err(TsigError::Missing) => Err(dns_proto::message::RCODE_NOTAUTH),
+    }
+}
+
+/// Re-sign transfer frames with TSIG, chaining each MAC onto the previous.
+fn sign_transfer_frames(
+    ctx: &ServerCtx,
+    query: &Message,
+    frames: Vec<Vec<u8>>,
+    request_mac: &[u8],
+) -> Vec<Vec<u8>> {
+    let Some(tsig) = &query.tsig else { return frames };
+    let Some(key) = ctx.tsig_keys.get(&tsig.key_name) else { return frames };
+    let now = unix_now();
+    let mut prior = request_mac.to_vec();
+    let mut out = Vec::with_capacity(frames.len());
+    for frame in frames {
+        // Each frame is length-prefixed; re-parse the message to re-sign it.
+        let Ok(msg) = Message::parse(&frame[2..]) else {
+            out.push(frame);
+            continue;
+        };
+        let signed = dns_tsig::sign_response(&msg, key, &prior, now);
+        // The MAC we just produced chains into the next message.
+        if let Ok(parsed) = Message::parse(&signed) {
+            if let Some(t) = parsed.tsig {
+                prior = t.mac;
+            }
+        }
+        out.push(frame_one(&signed).pop().unwrap());
+    }
+    out
+}
+
+fn frame_one(wire: &[u8]) -> Vec<Vec<u8>> {
+    let mut framed = Vec::with_capacity(wire.len() + 2);
+    framed.extend_from_slice(&(wire.len() as u16).to_be_bytes());
+    framed.extend_from_slice(wire);
+    vec![framed]
 }
 
 /// Echo the id back with FORMERR if there is enough to salvage one.

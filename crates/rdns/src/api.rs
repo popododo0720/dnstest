@@ -38,8 +38,32 @@ pub struct ApiCtx {
     pub zone_dir: Option<PathBuf>,
     /// Secondaries to NOTIFY after a change.
     pub notify_targets: Vec<std::net::SocketAddr>,
+    /// Change journal, for IXFR after API edits.
+    pub journal: Arc<dns_xfr::Journal>,
+    /// DNSSEC signer + origins + validity; re-signs edited zones.
+    pub dnssec: Option<(Arc<dns_dnssec::DnssecKey>, Vec<DnsName>, u64)>,
     /// Serializes writers; readers work on lock-free snapshots.
     pub write_lock: tokio::sync::Mutex<()>,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// After a zone edit: record the change in the journal (for IXFR) and re-sign
+/// if the zone is DNSSEC-signed.
+fn after_change(ctx: &ApiCtx, old: Option<&Zone>, new: &Zone) {
+    if let Some(old) = old {
+        ctx.journal.record(old, new);
+    }
+    if let Some((key, origins, validity)) = &ctx.dnssec {
+        if origins.contains(&new.origin) {
+            ctx.resolver.resign(key, origins, unix_now(), *validity);
+        }
+    }
 }
 
 /// Tell configured secondaries the zone changed (fire-and-forget).
@@ -319,6 +343,7 @@ async fn create_zone(ctx: &ApiCtx, body: &[u8]) -> Reply {
     let mut zones = current.as_ref().clone();
     zones.push(zone.clone());
     ctx.resolver.set_zones(zones);
+    after_change(ctx, None, &zone);
     persist(ctx, &zone);
     notify_secondaries(ctx, &origin);
     info!("api: created zone {origin}");
@@ -340,7 +365,8 @@ async fn patch_zone(ctx: &ApiCtx, name: &str, body: &[u8]) -> Reply {
         return Reply::error("404 Not Found", "no such zone");
     };
 
-    let mut zone = current[idx].clone();
+    let old = current[idx].clone();
+    let mut zone = old.clone();
     for rrset in &req.rrsets {
         if let Err(e) = apply_rrset(&mut zone, rrset) {
             return Reply::error("400 Bad Request", e);
@@ -351,6 +377,7 @@ async fn patch_zone(ctx: &ApiCtx, name: &str, body: &[u8]) -> Reply {
     let mut zones = current.as_ref().clone();
     zones[idx] = zone.clone();
     ctx.resolver.set_zones(zones);
+    after_change(ctx, Some(&old), &zone);
     persist(ctx, &zone);
     notify_secondaries(ctx, &origin);
     info!("api: patched zone {origin} ({} rrsets)", req.rrsets.len());

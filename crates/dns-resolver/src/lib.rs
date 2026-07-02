@@ -14,15 +14,17 @@ mod upstream;
 pub use rpz::{Rpz, RpzAction};
 pub use upstream::ForwardError;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
 use dns_cache::{Cache, Key};
+use dns_dnssec::SignedZone;
 use dns_metrics::Metrics;
 use dns_proto::message::{
     CLASS_ANY, CLASS_CH, CLASS_IN, Message, RCODE_FORMERR, RCODE_NOTIMP, RCODE_NXDOMAIN,
-    RCODE_REFUSED, RCODE_SERVFAIL, RData, Record, TYPE_A, TYPE_AAAA, TYPE_ANY, TYPE_AXFR,
-    TYPE_IXFR, TYPE_SOA, TYPE_TXT,
+    Question, RCODE_REFUSED, RCODE_SERVFAIL, RData, Record, TYPE_A, TYPE_AAAA, TYPE_ANY,
+    TYPE_AXFR, TYPE_DNSKEY, TYPE_IXFR, TYPE_SOA, TYPE_TXT,
 };
 use dns_proto::name::DnsName;
 use dns_zone::Zone;
@@ -37,6 +39,8 @@ pub struct Resolver {
     /// Conditional forwarding: (zone, upstreams), longest suffix wins.
     forwards: Vec<(DnsName, UpstreamPool)>,
     rpz: RwLock<Arc<Rpz>>,
+    /// DNSSEC-signed material by zone origin (empty when unsigned).
+    signed: RwLock<Arc<HashMap<DnsName, Arc<SignedZone>>>>,
     cache: Cache,
     flight: Singleflight,
     metrics: Arc<Metrics>,
@@ -49,6 +53,7 @@ pub struct ResolverOptions {
     pub forwards: Vec<(DnsName, Vec<SocketAddr>)>,
     pub cache_size: usize,
     pub rpz: Rpz,
+    pub signed: HashMap<DnsName, Arc<SignedZone>>,
 }
 
 /// Result of the synchronous resolution attempt.
@@ -78,10 +83,39 @@ impl Resolver {
                 .filter_map(|(zone, ups)| UpstreamPool::new(ups).map(|p| (zone, p)))
                 .collect(),
             rpz: RwLock::new(Arc::new(opts.rpz)),
+            signed: RwLock::new(Arc::new(opts.signed)),
             cache: Cache::new(opts.cache_size.max(1)),
             flight: Singleflight::default(),
             metrics,
         }
+    }
+
+    /// Replace the DNSSEC-signed material (re-sign on reload).
+    pub fn set_signed(&self, signed: HashMap<DnsName, Arc<SignedZone>>) {
+        *self.signed.write().unwrap() = Arc::new(signed);
+    }
+
+    /// (Re)sign the given origins with `key` over the current zone data.
+    /// Called at startup, on SIGHUP, and after API edits so RRSIGs stay fresh.
+    pub fn resign(
+        &self,
+        key: &dns_dnssec::DnssecKey,
+        origins: &[DnsName],
+        now: u64,
+        validity_secs: u64,
+    ) {
+        let zones = self.zones();
+        let mut map = HashMap::new();
+        for origin in origins {
+            if let Some(zone) = zones.iter().find(|z| z.origin == *origin) {
+                map.insert(origin.clone(), Arc::new(SignedZone::sign(zone, key, now, validity_secs)));
+            }
+        }
+        self.set_signed(map);
+    }
+
+    fn signed_zones(&self) -> Arc<HashMap<DnsName, Arc<SignedZone>>> {
+        self.signed.read().unwrap().clone()
     }
 
     /// The upstream pool responsible for `name`: the most specific forward
@@ -179,11 +213,33 @@ impl Resolver {
         let zones = self.zones();
         if let Some(zone) = find_zone(&zones, &q.qname) {
             resp.flags.aa = true;
+            // DNSSEC is engaged only when the client set the DO bit (RFC 6840).
+            let signed = self.signed_zones();
+            let dnssec = query
+                .edns
+                .as_ref()
+                .filter(|e| e.do_bit)
+                .and_then(|_| signed.get(&zone.origin))
+                .cloned();
+
+            // Apex DNSKEY is synthesized from the signing key, not zone data.
+            if q.qtype == TYPE_DNSKEY && q.qname == zone.origin {
+                if let Some(sz) = &dnssec {
+                    let (rrset, rrsig) = sz.dnskey_records();
+                    resp.answers.extend(rrset.iter().cloned());
+                    resp.answers.push(rrsig.clone());
+                    return Outcome::Done(resp);
+                }
+            }
+
             let result = zone.lookup(&q.qname, q.qtype);
             resp.flags.rcode = result.rcode;
             resp.answers = result.answers;
             if result.negative {
                 resp.authorities.push(zone.soa.clone());
+            }
+            if let Some(sz) = &dnssec {
+                attach_dnssec(&mut resp, q, zone, sz, result.negative);
             }
             // A CNAME chain that leaves the zone: keep resolving if the
             // client asked for recursion and is allowed to use it.
@@ -342,6 +398,41 @@ fn chaos_answer(mut resp: Message, q: &dns_proto::message::Question) -> Message 
         resp.flags.rcode = RCODE_REFUSED;
     }
     resp
+}
+
+/// Attach DNSSEC records to an authoritative response (RFC 4035 §3.1):
+/// RRSIGs beside every answer rrset, and NSEC + RRSIG proving denial.
+fn attach_dnssec(resp: &mut Message, q: &Question, zone: &Zone, sz: &SignedZone, negative: bool) {
+    // Sign each answer rrset (group by owner+type to sign once per set).
+    let mut signed_sets: Vec<(DnsName, u16)> = Vec::new();
+    let owners_types: Vec<(DnsName, u16)> =
+        resp.answers.iter().map(|r| (r.name.clone(), r.rtype())).collect();
+    for (owner, rtype) in owners_types {
+        if signed_sets.contains(&(owner.clone(), rtype)) {
+            continue;
+        }
+        if let Some(rrsig) = sz.rrsig_for(&owner, rtype) {
+            resp.answers.push(rrsig.clone());
+        }
+        signed_sets.push((owner, rtype));
+    }
+
+    if negative {
+        // Sign the SOA that lookup put in the authority section.
+        if let Some(rrsig) = sz.rrsig_for(&zone.origin, TYPE_SOA) {
+            resp.authorities.push(rrsig.clone());
+        }
+        let nsec = if resp.flags.rcode == RCODE_NXDOMAIN {
+            sz.covering_nsec(&q.qname)
+        } else {
+            // NODATA: the name exists, prove the type is absent.
+            sz.exact_nsec(&q.qname).or_else(|| sz.covering_nsec(&q.qname))
+        };
+        if let Some((nsec, rrsig)) = nsec {
+            resp.authorities.push(nsec.clone());
+            resp.authorities.push(rrsig.clone());
+        }
+    }
 }
 
 fn find_zone<'a>(zones: &'a [Zone], name: &DnsName) -> Option<&'a Zone> {

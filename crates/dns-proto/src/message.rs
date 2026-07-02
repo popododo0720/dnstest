@@ -45,9 +45,20 @@ pub const TYPE_TXT: u16 = 16;
 pub const TYPE_AAAA: u16 = 28;
 pub const TYPE_SRV: u16 = 33;
 pub const TYPE_OPT: u16 = 41;
+pub const TYPE_DS: u16 = 43;
+pub const TYPE_RRSIG: u16 = 46;
+pub const TYPE_NSEC: u16 = 47;
+pub const TYPE_DNSKEY: u16 = 48;
 pub const TYPE_IXFR: u16 = 251;
 pub const TYPE_AXFR: u16 = 252;
+pub const TYPE_TSIG: u16 = 250;
 pub const TYPE_ANY: u16 = 255;
+
+pub const RCODE_NOTAUTH: u8 = 9;
+/// TSIG extended rcodes (carried in the TSIG error field, RFC 8945 §4.3).
+pub const TSIG_BADSIG: u16 = 16;
+pub const TSIG_BADKEY: u16 = 17;
+pub const TSIG_BADTIME: u16 = 18;
 
 pub fn type_name(t: u16) -> String {
     match t {
@@ -61,8 +72,13 @@ pub fn type_name(t: u16) -> String {
         TYPE_AAAA => "AAAA".into(),
         TYPE_SRV => "SRV".into(),
         TYPE_OPT => "OPT".into(),
+        TYPE_DS => "DS".into(),
+        TYPE_RRSIG => "RRSIG".into(),
+        TYPE_NSEC => "NSEC".into(),
+        TYPE_DNSKEY => "DNSKEY".into(),
         TYPE_IXFR => "IXFR".into(),
         TYPE_AXFR => "AXFR".into(),
+        TYPE_TSIG => "TSIG".into(),
         TYPE_ANY => "ANY".into(),
         other => format!("TYPE{other}"),
     }
@@ -315,6 +331,38 @@ impl RData {
             RData::Unknown { data, .. } => out.extend_from_slice(data),
         }
     }
+
+    /// Canonical rdata (RFC 4034 §6.2): names uncompressed. Our names are
+    /// stored lowercased, so `to_wire(None)` already yields canonical output.
+    pub fn encode_canonical(&self, out: &mut Vec<u8>) {
+        match self {
+            RData::Ns(n) | RData::Cname(n) | RData::Ptr(n) => n.to_wire(out, None),
+            RData::Soa(soa) => {
+                soa.mname.to_wire(out, None);
+                soa.rname.to_wire(out, None);
+                out.extend_from_slice(&soa.serial.to_be_bytes());
+                out.extend_from_slice(&soa.refresh.to_be_bytes());
+                out.extend_from_slice(&soa.retry.to_be_bytes());
+                out.extend_from_slice(&soa.expire.to_be_bytes());
+                out.extend_from_slice(&soa.minimum.to_be_bytes());
+            }
+            RData::Mx { preference, exchange } => {
+                out.extend_from_slice(&preference.to_be_bytes());
+                exchange.to_wire(out, None);
+            }
+            RData::Srv { priority, weight, port, target } => {
+                out.extend_from_slice(&priority.to_be_bytes());
+                out.extend_from_slice(&weight.to_be_bytes());
+                out.extend_from_slice(&port.to_be_bytes());
+                target.to_wire(out, None);
+            }
+            // Types with no embedded names encode identically either way.
+            _ => {
+                let mut comp = Compressor::default();
+                self.encode(out, &mut comp);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +389,22 @@ impl Record {
         let rdlen = (out.len() - len_at - 2) as u16;
         out[len_at..len_at + 2].copy_from_slice(&rdlen.to_be_bytes());
     }
+
+    /// Canonical RR wire form for DNSSEC (RFC 4034 §6.2): owner and rdata
+    /// names uncompressed and lowercased, with `original_ttl` in place of the
+    /// live TTL. DnsName already stores labels lowercased, so no case fixups
+    /// are needed here.
+    pub fn encode_canonical(&self, out: &mut Vec<u8>, original_ttl: u32) {
+        self.name.to_wire(out, None);
+        out.extend_from_slice(&self.rtype().to_be_bytes());
+        out.extend_from_slice(&self.class.to_be_bytes());
+        out.extend_from_slice(&original_ttl.to_be_bytes());
+        let len_at = out.len();
+        out.extend_from_slice(&[0, 0]);
+        self.rdata.encode_canonical(out);
+        let rdlen = (out.len() - len_at - 2) as u16;
+        out[len_at..len_at + 2].copy_from_slice(&rdlen.to_be_bytes());
+    }
 }
 
 /// EDNS0 pseudo-record (the OPT RR abuses the name/class/ttl fields, so it is
@@ -362,6 +426,76 @@ impl Edns {
     }
 }
 
+/// TSIG record (RFC 8945). Modeled separately from `Record` like OPT because
+/// it hijacks the owner/class/ttl fields and must be the final RR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tsig {
+    /// Owner name of the TSIG RR == the shared key's name.
+    pub key_name: DnsName,
+    pub algorithm: DnsName,
+    /// Seconds since the Unix epoch (48-bit on the wire).
+    pub time_signed: u64,
+    pub fudge: u16,
+    pub mac: Vec<u8>,
+    pub original_id: u16,
+    pub error: u16,
+    pub other: Vec<u8>,
+}
+
+impl Tsig {
+    /// The RR-specific "TSIG variables" digested into the MAC (RFC 8945
+    /// §4.3.3): owner name, class ANY, TTL 0, then algorithm/time/fudge/
+    /// error/other but NOT the MAC itself.
+    pub fn variables(&self) -> Vec<u8> {
+        let mut v = Vec::new();
+        self.key_name.to_wire(&mut v, None);
+        v.extend_from_slice(&CLASS_ANY.to_be_bytes());
+        v.extend_from_slice(&0u32.to_be_bytes()); // TTL
+        self.algorithm.to_wire(&mut v, None);
+        v.extend_from_slice(&self.time_signed.to_be_bytes()[2..]); // 48-bit
+        v.extend_from_slice(&self.fudge.to_be_bytes());
+        v.extend_from_slice(&self.error.to_be_bytes());
+        v.extend_from_slice(&(self.other.len() as u16).to_be_bytes());
+        v.extend_from_slice(&self.other);
+        v
+    }
+
+    fn encode_rr(&self, out: &mut Vec<u8>) {
+        self.key_name.to_wire(out, None);
+        out.extend_from_slice(&TYPE_TSIG.to_be_bytes());
+        out.extend_from_slice(&CLASS_ANY.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        let len_at = out.len();
+        out.extend_from_slice(&[0, 0]);
+        self.algorithm.to_wire(out, None);
+        out.extend_from_slice(&self.time_signed.to_be_bytes()[2..]);
+        out.extend_from_slice(&self.fudge.to_be_bytes());
+        out.extend_from_slice(&(self.mac.len() as u16).to_be_bytes());
+        out.extend_from_slice(&self.mac);
+        out.extend_from_slice(&self.original_id.to_be_bytes());
+        out.extend_from_slice(&self.error.to_be_bytes());
+        out.extend_from_slice(&(self.other.len() as u16).to_be_bytes());
+        out.extend_from_slice(&self.other);
+        let rdlen = (out.len() - len_at - 2) as u16;
+        out[len_at..len_at + 2].copy_from_slice(&rdlen.to_be_bytes());
+    }
+
+    fn parse_rdata(key_name: DnsName, buf: &[u8], pos: &mut usize) -> Result<Self, WireError> {
+        let algorithm = DnsName::from_wire(buf, pos)?;
+        let hi = read_u16(buf, pos)? as u64;
+        let lo = read_u32(buf, pos)? as u64;
+        let time_signed = (hi << 32) | lo;
+        let fudge = read_u16(buf, pos)?;
+        let mac_size = read_u16(buf, pos)? as usize;
+        let mac = read_bytes(buf, pos, mac_size)?.to_vec();
+        let original_id = read_u16(buf, pos)?;
+        let error = read_u16(buf, pos)?;
+        let other_len = read_u16(buf, pos)? as usize;
+        let other = read_bytes(buf, pos, other_len)?.to_vec();
+        Ok(Tsig { key_name, algorithm, time_signed, fudge, mac, original_id, error, other })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub id: u16,
@@ -371,6 +505,11 @@ pub struct Message {
     pub authorities: Vec<Record>,
     pub additionals: Vec<Record>,
     pub edns: Option<Edns>,
+    /// Present when a TSIG RR terminated the message (RFC 8945).
+    pub tsig: Option<Tsig>,
+    /// Byte offset where the TSIG RR's owner name began, for MAC recompute.
+    /// Transient: set by [`Message::parse`], never encoded.
+    pub tsig_start: Option<usize>,
 }
 
 impl Message {
@@ -383,6 +522,8 @@ impl Message {
             authorities: Vec::new(),
             additionals: Vec::new(),
             edns: None,
+            tsig: None,
+            tsig_start: None,
         }
     }
 
@@ -426,6 +567,7 @@ impl Message {
             }
         }
         for _ in 0..ar {
+            let start = pos;
             match parse_entry(buf, &mut pos)? {
                 Entry::Rr(r) => msg.additionals.push(r),
                 // RFC 6891: at most one OPT; keep the first, ignore extras.
@@ -434,9 +576,25 @@ impl Message {
                         msg.edns = Some(e);
                     }
                 }
+                // RFC 8945: TSIG must be the last RR; remember where it began
+                // so the MAC can be recomputed over the preceding bytes.
+                Entry::Tsig(t) => {
+                    msg.tsig = Some(t);
+                    msg.tsig_start = Some(start);
+                }
             }
         }
         Ok(msg)
+    }
+
+    /// Append a fully-formed TSIG RR and bump ARCOUNT. Used after the MAC has
+    /// been computed over `encode()` output.
+    pub fn encode_with_tsig(&self, tsig: &Tsig) -> Vec<u8> {
+        let mut out = self.encode();
+        tsig.encode_rr(&mut out);
+        let arcount = u16::from_be_bytes([out[10], out[11]]).wrapping_add(1);
+        out[10..12].copy_from_slice(&arcount.to_be_bytes());
+        out
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -491,6 +649,7 @@ impl Message {
 enum Entry {
     Rr(Record),
     Opt(Edns),
+    Tsig(Tsig),
 }
 
 fn parse_entry(buf: &[u8], pos: &mut usize) -> Result<Entry, WireError> {
@@ -499,6 +658,14 @@ fn parse_entry(buf: &[u8], pos: &mut usize) -> Result<Entry, WireError> {
     let class = read_u16(buf, pos)?;
     let ttl = read_u32(buf, pos)?;
     let rdlen = read_u16(buf, pos)? as usize;
+    if rtype == TYPE_TSIG {
+        let end = pos.checked_add(rdlen).ok_or(WireError::Truncated)?;
+        let t = Tsig::parse_rdata(name, buf, pos)?;
+        if *pos != end {
+            return Err(WireError::BadRdata);
+        }
+        return Ok(Entry::Tsig(t));
+    }
     if rtype == TYPE_OPT {
         let data = read_bytes(buf, pos, rdlen)?.to_vec();
         return Ok(Entry::Opt(Edns {

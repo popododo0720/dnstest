@@ -8,6 +8,7 @@ edition.workspace = true
 dns-proto.workspace = true
 dns-zone.workspace = true
 dns-cache.workspace = true
+dns-dnssec.workspace = true
 dns-metrics.workspace = true
 tokio.workspace = true
 tracing.workspace = true

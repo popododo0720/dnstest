@@ -38,3 +38,28 @@ notify = []                    # secondaries to NOTIFY on zone change
 
 [rpz]
 # file = "rpz.txt"             # `domain` = NXDOMAIN, `domain addr` = sinkhole
+
+# --- TSIG keys (transfer authentication, RFC 8945) ---
+# [[tsig_key]]
+# name = "xfrkey."
+# algorithm = "hmac-sha256"        # or hmac-sha512
+# secret = "base64-encoded-secret"
+
+# Require TSIG on outbound AXFR/IXFR:
+# transfer.require_tsig = "xfrkey."
+# Sign inbound transfers on a secondary:
+# secondary.tsig_key = "xfrkey."
+
+# --- DNSSEC online signing (Ed25519, RFC 8080) ---
+[dnssec]
+# key_file = "ksk.seed"            # 32-byte Ed25519 seed (base64); auto-generated
+# zones = ["example.lab."]         # origins to sign online
+# validity_days = 14
+
+# --- DNS-over-TLS (RFC 7858) and DNS-over-HTTPS (RFC 8484) ---
+[tls]
+# cert = "cert.pem"                # omit for a self-signed dev cert
+# key = "key.pem"
+# self_signed_names = ["dns.example.lab"]
+# dot_listen = "0.0.0.0:853"
+# doh_listen = "0.0.0.0:443"       # HTTP/1.1; use curl/POST or GET ?dns=

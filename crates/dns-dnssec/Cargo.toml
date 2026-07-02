@@ -1,0 +1,10 @@
+[package]
+name = "dns-dnssec"
+description = "DNSSEC online signing: DNSKEY, RRSIG, NSEC, DS (Ed25519)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dns-proto.workspace = true
+dns-zone.workspace = true
+ring.workspace = true

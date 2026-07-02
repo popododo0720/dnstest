@@ -1,0 +1,12 @@
+[package]
+name = "dns-tls"
+description = "DNS-over-TLS (RFC 7858) and DNS-over-HTTPS (RFC 8484) setup"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio-rustls.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+rustls-pemfile.workspace = true
+tracing.workspace = true

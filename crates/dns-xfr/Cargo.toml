@@ -9,5 +9,6 @@ dns-proto.workspace = true
 dns-zone.workspace = true
 dns-metrics.workspace = true
 dns-resolver.workspace = true
+dns-tsig.workspace = true
 tokio.workspace = true
 tracing.workspace = true
